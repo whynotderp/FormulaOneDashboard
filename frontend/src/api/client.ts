@@ -172,9 +172,9 @@ export const predictRace = (circuitId: string, weather = 'dry', sessionKey?: num
   api.get<RacePrediction>('/api/predictor/race', {
     params: { circuit_id: circuitId, weather, session_key: sessionKey },
   });
-export const getFantasyTeam = (circuitId: string, budget = 100) =>
-  api.get<FantasyTeam>('/api/fantasy/team', { params: { circuit_id: circuitId, budget } });
-export const getFantasyDrivers = (circuitId: string) =>
-  api.get<FantasyDriver[]>('/api/fantasy/drivers', { params: { circuit_id: circuitId } });
-export const getFantasyConstructors = (circuitId: string) =>
-  api.get<FantasyConstructor[]>('/api/fantasy/constructors', { params: { circuit_id: circuitId } });
+export const getFantasyTeam = (circuitId: string, budget = 100, sessionKey?: number) =>
+  api.get<FantasyTeam>('/api/fantasy/team', { params: { circuit_id: circuitId, budget, session_key: sessionKey } });
+export const getFantasyDrivers = (circuitId: string, sessionKey?: number) =>
+  api.get<FantasyDriver[]>('/api/fantasy/drivers', { params: { circuit_id: circuitId, session_key: sessionKey } });
+export const getFantasyConstructors = (circuitId: string, sessionKey?: number) =>
+  api.get<FantasyConstructor[]>('/api/fantasy/constructors', { params: { circuit_id: circuitId, session_key: sessionKey } });

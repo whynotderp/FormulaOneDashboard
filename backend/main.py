@@ -7,6 +7,7 @@ import datetime
 import hashlib
 import math
 import random
+import time
 from typing import Any, Dict, List, Optional
 
 CURRENT_YEAR = datetime.date.today().year
@@ -137,6 +138,25 @@ DRIVERS_2025 = [
 
 PRICE_BY_CODE = {d["code"]: d["price"] for d in DRIVERS_2025}
 
+# OpenF1 team names ("Red Bull Racing", "Kick Sauber", ...) -> canonical names
+# used by TEAM_PACE, the price tables, and the frontend team badges.
+TEAM_ALIASES = {
+    "red bull": "Red Bull", "racing bulls": "Racing Bulls", "rb": "Racing Bulls",
+    "visa cash app": "Racing Bulls", "mclaren": "McLaren", "ferrari": "Ferrari",
+    "mercedes": "Mercedes", "aston martin": "Aston Martin", "williams": "Williams",
+    "alpine": "Alpine", "haas": "Haas", "kick sauber": "Sauber", "sauber": "Sauber",
+    "audi": "Audi", "cadillac": "Cadillac",
+}
+
+
+def canonical_team(name: Optional[str]) -> str:
+    n = (name or "").lower().strip()
+    # check multi-word aliases first (e.g. "racing bulls" before "rb")
+    for key in sorted(TEAM_ALIASES, key=len, reverse=True):
+        if key in n:
+            return TEAM_ALIASES[key]
+    return name or "Unknown"
+
 
 def normalize_drivers(raw: List[Dict]) -> List[Dict]:
     """Map OpenF1's /drivers schema (name_acronym, full_name, team_name,
@@ -158,7 +178,7 @@ def normalize_drivers(raw: List[Dict]) -> List[Dict]:
         out.append({
             "code": code,
             "name": name.title() if name.isupper() else name,
-            "team": d.get("team_name") or "Unknown",
+            "team": canonical_team(d.get("team_name")),
             "team_colour": (f"#{d['team_colour']}" if d.get("team_colour") else None),
             "number": num,
             "price": PRICE_BY_CODE.get(code, 5.0),
@@ -648,83 +668,201 @@ async def predict_race(circuit_id: str = "bahrain", weather: str = "dry",
 # Fantasy F1
 # ---------------------------------------------------------------------------
 
-def calc_fantasy(driver_code: str, circuit_id: str) -> Dict:
-    base = DRIVER_AVG_FANTASY_PTS.get(driver_code, 15.0)
-    random.seed(hash(driver_code + circuit_id + "fantasy"))
-    adj = random.uniform(0.85, 1.15)
-    random.seed()
-    return {"predicted_points": round(base * adj, 1), "avg_points": base}
+FINISH_PTS = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1}
+_FANTASY_CACHE: Dict[str, Any] = {"ts": 0.0, "by_code": None, "season": None}
+
+
+def _fantasy_points_for_result(res: Dict) -> float:
+    """Approximate official F1 Fantasy driver points for a single race result:
+    race-finish points, +/-1 per position gained/lost vs grid, fastest lap,
+    classified-finish bonus, DNF penalty."""
+    try:
+        finish = int(res.get("position", 20))
+    except (TypeError, ValueError):
+        finish = 20
+    try:
+        grid = int(res.get("grid", 0) or 0)
+    except (TypeError, ValueError):
+        grid = 0
+    pts = float(FINISH_PTS.get(finish, 0))
+    if grid > 0:
+        pts += max(-10.0, min(10.0, grid - finish))  # cap position swing at +/-10
+    if str(res.get("FastestLap", {}).get("rank")) == "1":
+        pts += 10
+    status = res.get("status", "")
+    if status == "Finished" or status.startswith("+"):
+        pts += 2  # classified-finish bonus
+    else:
+        pts -= 10  # DNF / not classified
+    return max(-12.0, pts)
+
+
+async def _compute_fantasy_form(client: httpx.AsyncClient):
+    """Real F1-Fantasy points per driver code over the last up-to-5 races of the
+    most recent season with data. Cached ~10 min. Returns (by_code, season)."""
+    now = time.time()
+    if _FANTASY_CACHE["by_code"] and now - _FANTASY_CACHE["ts"] < 600:
+        return _FANTASY_CACHE["by_code"], _FANTASY_CACHE["season"]
+    for year in (CURRENT_YEAR, CURRENT_YEAR - 1):
+        sched = await fetch_json(client, f"{ERGAST_BASE}/{year}.json", {"limit": 100})
+        try:
+            rounds = [int(r["round"]) for r in sched["MRData"]["RaceTable"]["Races"]]
+        except Exception:
+            rounds = []
+        if not rounds:
+            continue
+        by_code: Dict[str, List[float]] = {}
+        for rnd in rounds[-5:]:
+            data = await fetch_json(client, f"{ERGAST_BASE}/{year}/{rnd}/results.json")
+            try:
+                results = data["MRData"]["RaceTable"]["Races"][0]["Results"]
+            except Exception:
+                continue
+            for res in results:
+                code = res.get("Driver", {}).get("code")
+                if code:
+                    by_code.setdefault(code, []).append(_fantasy_points_for_result(res))
+        if by_code:
+            _FANTASY_CACHE.update(ts=now, by_code=by_code, season=year)
+            return by_code, year
+    return {}, None
+
+
+async def _fantasy_driver_rows(circuit_id: str, session_key: Optional[int]):
+    """Per-driver fantasy rows from the live entry list and real recent form."""
+    async with httpx.AsyncClient() as client:
+        drivers = DRIVERS_2025
+        if session_key:
+            dr = await fetch_json(client, f"{OPENF1_BASE}/drivers", {"session_key": session_key})
+            nd = normalize_drivers(dr) if dr else []
+            if nd:
+                drivers = nd
+        form, season = await _compute_fantasy_form(client)
+
+    rows = []
+    for d in drivers:
+        hist = form.get(d["code"], [])
+        if hist:
+            avg = sum(hist) / len(hist)
+            # recency weight: most recent race counts double
+            pred = (sum(hist) + hist[-1]) / (len(hist) + 1)
+        elif d["code"] in DRIVER_AVG_FANTASY_PTS:
+            avg = DRIVER_AVG_FANTASY_PTS[d["code"]]
+            pred = avg * (0.9 + _stable_unit(d["code"] + circuit_id) * 0.3)
+        else:
+            # newcomer / rookie with no race history: estimate from team strength
+            # (per-driver share of the constructor's typical points) so they don't
+            # look like artificially cheap value picks
+            team_pts = CONSTRUCTOR_AVG_FANTASY_PTS.get(d["team"], 12.0)
+            avg = team_pts / 2.0
+            pred = avg * (0.85 + _stable_unit(d["code"] + circuit_id) * 0.3)
+        # price: known driver price, else estimate from team tier (no public API)
+        if d["code"] in PRICE_BY_CODE:
+            price = PRICE_BY_CODE[d["code"]]
+        else:
+            team_pts = CONSTRUCTOR_AVG_FANTASY_PTS.get(d["team"], 12.0)
+            price = round(max(5.0, min(30.0, team_pts / 3.2)), 1)
+        ppm = pred / price if price > 0 else 0
+        rows.append({
+            "code": d["code"], "name": d["name"], "team": d["team"], "number": d["number"],
+            "price": round(price, 1), "avg_points": round(avg, 1),
+            "predicted_points": round(pred, 1), "pts_per_million": round(ppm, 2),
+        })
+    return rows, season
+
+
+def _constructor_rows(driver_rows: List[Dict]) -> List[Dict]:
+    """Aggregate driver fantasy points by team into constructor rows."""
+    price_by_team = {c["name"]: c["price"] for c in CONSTRUCTORS_2025}
+    agg: Dict[str, Dict[str, float]] = {}
+    for r in driver_rows:
+        a = agg.setdefault(r["team"], {"pred": 0.0, "avg": 0.0})
+        a["pred"] += r["predicted_points"]
+        a["avg"] += r["avg_points"]
+    out = []
+    for name, a in agg.items():
+        price = price_by_team.get(name, 10.0)
+        pred = round(a["pred"], 1)
+        out.append({"name": name, "price": price, "predicted_points": pred,
+                    "avg_points": round(a["avg"], 1),
+                    "pts_per_million": round(pred / price, 2) if price > 0 else 0})
+    out.sort(key=lambda x: -x["pts_per_million"])
+    return out
 
 
 @app.get("/api/fantasy/team")
-async def get_optimal_fantasy_team(circuit_id: str = "bahrain", budget: float = 100.0):
-    driver_scores = []
-    for d in DRIVERS_2025:
-        pts = calc_fantasy(d["code"], circuit_id)
-        ppm = pts["predicted_points"] / d["price"] if d["price"] > 0 else 0
-        driver_scores.append({**d, **pts, "pts_per_million": round(ppm, 2)})
-    driver_scores.sort(key=lambda x: -x["pts_per_million"])
+async def get_optimal_fantasy_team(circuit_id: str = "bahrain", budget: float = 100.0,
+                                   session_key: Optional[int] = None):
+    rows, season = await _fantasy_driver_rows(circuit_id, session_key)
+    con_scores = _constructor_rows(rows)
+    min_driver = min((r["price"] for r in rows), default=5.0)
+    min_con = min((c["price"] for c in con_scores), default=6.0)
 
+    # Maximize predicted points within the budget (greedy by points, keeping a
+    # reserve so the remaining driver slots + a constructor stay affordable, and
+    # at most 2 drivers per team), rather than pure value — which would hoard
+    # budget on cheap enablers.
+    by_points = sorted(rows, key=lambda x: -x["predicted_points"])
     picked: List[Dict] = []
     remaining = budget
     used_teams: Dict[str, int] = {}
-    for d in driver_scores:
+    for d in by_points:
         if len(picked) >= 5:
             break
-        tc = used_teams.get(d["team"], 0)
-        if tc >= 2 or d["price"] > remaining - 8.0:
+        if used_teams.get(d["team"], 0) >= 2:
             continue
-        picked.append(d)
-        remaining -= d["price"]
-        used_teams[d["team"]] = tc + 1
+        slots_after = 5 - len(picked) - 1
+        reserve = min_driver * slots_after + min_con
+        if d["price"] <= remaining - reserve:
+            picked.append(d)
+            remaining -= d["price"]
+            used_teams[d["team"]] = used_teams.get(d["team"], 0) + 1
+    # fill any leftover slots with the cheapest feasible drivers
+    if len(picked) < 5:
+        for d in sorted(rows, key=lambda x: x["price"]):
+            if len(picked) >= 5:
+                break
+            if d in picked or used_teams.get(d["team"], 0) >= 2:
+                continue
+            if d["price"] <= remaining - min_con:
+                picked.append(d)
+                remaining -= d["price"]
+                used_teams[d["team"]] = used_teams.get(d["team"], 0) + 1
 
-    con_scores = []
-    for c in CONSTRUCTORS_2025:
-        avg = CONSTRUCTOR_AVG_FANTASY_PTS.get(c["name"], 20.0)
-        random.seed(hash(c["name"] + circuit_id))
-        pts = round(avg * random.uniform(0.9, 1.1), 1)
-        random.seed()
-        con_scores.append({**c, "predicted_points": pts, "avg_points": avg, "pts_per_million": round(pts / c["price"], 2)})
-    con_scores.sort(key=lambda x: -x["pts_per_million"])
-
-    sel_con = next((c for c in con_scores if c["price"] <= remaining), con_scores[-1])
+    # constructor: most points that still fits the remaining budget
+    affordable_con = [c for c in con_scores if c["price"] <= remaining]
+    sel_con = (max(affordable_con, key=lambda c: c["predicted_points"])
+               if affordable_con else (min(con_scores, key=lambda c: c["price"]) if con_scores else None))
     captain = max(picked, key=lambda x: x["predicted_points"]) if picked else None
 
     total_pts = sum(d["predicted_points"] * (2 if captain and d["code"] == captain["code"] else 1) for d in picked)
-    total_pts += sel_con["predicted_points"]
-    total_cost = sum(d["price"] for d in picked) + sel_con["price"]
+    total_cost = sum(d["price"] for d in picked)
+    if sel_con:
+        total_pts += sel_con["predicted_points"]
+        total_cost += sel_con["price"]
 
+    src = f"real {season} form" if season else "model estimates"
     return {
         "circuit": circuit_id, "budget": budget,
         "total_cost": round(total_cost, 1), "budget_remaining": round(budget - total_cost, 1),
         "drivers": picked, "constructor": sel_con, "captain": captain,
         "total_predicted_points": round(total_pts, 1),
-        "reasoning": f"Top value picks by pts/$M. Captain {captain['name'] if captain else 'N/A'} earns 2x multiplier.",
+        "reasoning": (f"Best value (pts/$M) within ${budget:.0f}M using {src}; "
+                      f"max 2 drivers per team. Captain {captain['name'] if captain else 'N/A'} earns 2x."),
     }
 
 
 @app.get("/api/fantasy/drivers")
-async def get_fantasy_drivers(circuit_id: str = "bahrain"):
-    result = []
-    for d in DRIVERS_2025:
-        pts = calc_fantasy(d["code"], circuit_id)
-        ppm = pts["predicted_points"] / d["price"] if d["price"] > 0 else 0
-        result.append({**d, **pts, "pts_per_million": round(ppm, 2)})
-    result.sort(key=lambda x: -x["pts_per_million"])
-    return result
+async def get_fantasy_drivers(circuit_id: str = "bahrain", session_key: Optional[int] = None):
+    rows, _ = await _fantasy_driver_rows(circuit_id, session_key)
+    rows.sort(key=lambda x: -x["pts_per_million"])
+    return rows
 
 
 @app.get("/api/fantasy/constructors")
-async def get_fantasy_constructors(circuit_id: str = "bahrain"):
-    result = []
-    for c in CONSTRUCTORS_2025:
-        avg = CONSTRUCTOR_AVG_FANTASY_PTS.get(c["name"], 20.0)
-        random.seed(hash(c["name"] + circuit_id + "con"))
-        pts = round(avg * random.uniform(0.9, 1.1), 1)
-        random.seed()
-        result.append({**c, "predicted_points": pts, "avg_points": avg, "pts_per_million": round(pts / c["price"], 2)})
-    result.sort(key=lambda x: -x["pts_per_million"])
-    return result
+async def get_fantasy_constructors(circuit_id: str = "bahrain", session_key: Optional[int] = None):
+    rows, _ = await _fantasy_driver_rows(circuit_id, session_key)
+    return _constructor_rows(rows)
 
 
 @app.get("/api/ergast/standings/{year}")

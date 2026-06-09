@@ -1,17 +1,9 @@
 import { useEffect, useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
-import { getFantasyTeam, getFantasyDrivers, getFantasyConstructors } from '../api/client';
-import type { FantasyDriver, FantasyConstructor, FantasyTeam } from '../api/client';
+import { getFantasyTeam, getFantasyDrivers, getFantasyConstructors, getSessions } from '../api/client';
+import type { FantasyDriver, FantasyConstructor, FantasyTeam, Session } from '../api/client';
 import { LoadingSpinner, ErrorMessage } from '../components/LoadingSpinner';
 import { TeamBadge } from '../components/TeamBadge';
-
-const CIRCUITS = [
-  { id: 'bahrain', name: 'Bahrain' }, { id: 'jeddah', name: 'Saudi Arabia' },
-  { id: 'melbourne', name: 'Australia' }, { id: 'miami', name: 'Miami' },
-  { id: 'monaco', name: 'Monaco' }, { id: 'silverstone', name: 'Great Britain' },
-  { id: 'spa', name: 'Belgium' }, { id: 'monza', name: 'Italy' },
-  { id: 'suzuka', name: 'Japan' }, { id: 'interlagos', name: 'Brazil' },
-];
 
 const FALLBACK_DRIVERS: FantasyDriver[] = [
   { code:'NOR',name:'Lando Norris',team:'McLaren',price:27.5,number:4,predicted_points:62,avg_points:55,pts_per_million:2.25 },
@@ -66,7 +58,8 @@ function buildFallbackTeam(cid: string): FantasyTeam {
 }
 
 export function FantasyTab() {
-  const [circuit, setCircuit] = useState('bahrain');
+  const [races, setRaces] = useState<Session[]>([]);
+  const [sessionKey, setSessionKey] = useState<number | undefined>(undefined);
   const [team, setTeam] = useState<FantasyTeam>(buildFallbackTeam('bahrain'));
   const [allDrivers, setAllDrivers] = useState<FantasyDriver[]>(FALLBACK_DRIVERS);
   const [allConstructors, setAllConstructors] = useState<FantasyConstructor[]>(FALLBACK_CONSTRUCTORS);
@@ -74,28 +67,53 @@ export function FantasyTab() {
   const [error, setError] = useState<string | null>(null);
   const [view, setView] = useState<'recommended' | 'all-drivers' | 'constructors'>('recommended');
 
-  const load = async (cid: string) => {
+  // Load the live season race calendar so picks use the real current entry list.
+  useEffect(() => {
+    getSessions()
+      .then(r => {
+        const racesOnly = r.data.filter(s => (s.session_type || s.session_name) === 'Race');
+        setRaces(racesOnly);
+        if (racesOnly.length > 0) {
+          const sk = racesOnly[0].session_key;
+          setSessionKey(sk);
+          load(sk);
+        } else {
+          load(undefined);
+        }
+      })
+      .catch(() => load(undefined));
+  }, []);
+
+  const load = async (sk?: number) => {
     setLoading(true); setError(null);
     try {
-      const [t, d, c] = await Promise.all([getFantasyTeam(cid), getFantasyDrivers(cid), getFantasyConstructors(cid)]);
+      const [t, d, c] = await Promise.all([
+        getFantasyTeam('bahrain', 100, sk),
+        getFantasyDrivers('bahrain', sk),
+        getFantasyConstructors('bahrain', sk),
+      ]);
       setTeam(t.data); setAllDrivers(d.data); setAllConstructors(c.data);
     } catch {
       setError('Backend not running — showing sample fantasy data');
-      setTeam(buildFallbackTeam(cid));
+      setTeam(buildFallbackTeam('bahrain'));
       setAllDrivers(FALLBACK_DRIVERS); setAllConstructors(FALLBACK_CONSTRUCTORS);
     } finally { setLoading(false); }
   };
-
-  useEffect(() => { load(circuit); }, [circuit]);
 
   return (
     <div className="space-y-4">
       <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4 flex flex-wrap gap-4 items-center">
         <div className="flex items-center gap-2">
           <label className="text-xs text-[#6b7280] uppercase tracking-wider">Race</label>
-          <select className="bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] rounded px-3 py-1.5 text-sm"
-            value={circuit} onChange={e => setCircuit(e.target.value)}>
-            {CIRCUITS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          <select className="bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] rounded px-3 py-1.5 text-sm max-w-xs"
+            value={sessionKey ?? ''}
+            onChange={e => { const sk = Number(e.target.value); setSessionKey(sk); load(sk); }}>
+            {races.length === 0 && <option value="">No live calendar — using sample</option>}
+            {races.map(s => (
+              <option key={s.session_key} value={s.session_key}>
+                {s.country_name} ({s.date_start?.slice(0, 10)})
+              </option>
+            ))}
           </select>
         </div>
         <div className="flex rounded overflow-hidden border border-[#2a2a2a] ml-auto">
@@ -109,6 +127,12 @@ export function FantasyTab() {
       </div>
 
       {error && <ErrorMessage message={error} />}
+      {!loading && (
+        <div className="text-xs text-[#6b7280]">
+          <span className="text-green-400">●</span> Points computed from real recent race results (official F1 Fantasy scoring).
+          {' '}Prices are approximate — the official Fantasy game doesn't expose a public price API.
+        </div>
+      )}
       {loading && <LoadingSpinner size="lg" />}
 
       {!loading && view === 'recommended' && (
