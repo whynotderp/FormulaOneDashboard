@@ -93,6 +93,7 @@ export interface PredictionResult {
 export interface RacePrediction {
   circuit: string;
   weather: string;
+  grid_source?: 'qualifying' | 'model';
   predictions: PredictionResult[];
   incident_probabilities: {
     safety_car: number;
@@ -138,7 +139,7 @@ export interface Track {
 }
 
 export interface TrackOutline {
-  source: 'telemetry' | 'generated';
+  source: 'telemetry' | 'circuit' | 'generated';
   viewBox: string;
   points: { x: number; y: number; t?: string }[];
   session_key?: number;
@@ -167,8 +168,10 @@ export const getRaceControl = (sessionKey: number) =>
 export const getPositions = (sessionKey: number) =>
   api.get<Position[]>('/api/positions', { params: { session_key: sessionKey } });
 export const getTrack = (trackId: string) => api.get<Track>(`/api/tracks/${trackId}`);
-export const predictRace = (circuitId: string, weather = 'dry') =>
-  api.get<RacePrediction>('/api/predictor/race', { params: { circuit_id: circuitId, weather } });
+export const predictRace = (circuitId: string, weather = 'dry', sessionKey?: number) =>
+  api.get<RacePrediction>('/api/predictor/race', {
+    params: { circuit_id: circuitId, weather, session_key: sessionKey },
+  });
 export const getFantasyTeam = (circuitId: string, budget = 100) =>
   api.get<FantasyTeam>('/api/fantasy/team', { params: { circuit_id: circuitId, budget } });
 export const getFantasyDrivers = (circuitId: string) =>

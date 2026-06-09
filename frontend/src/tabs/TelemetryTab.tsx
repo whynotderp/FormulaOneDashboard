@@ -131,7 +131,7 @@ function TrackMap({
     const loop = (now: number) => {
       const dt = (now - last) / 1000;
       last = now;
-      progress.current = (progress.current + dt * 0.05 * speed) % 1;
+      progress.current = (progress.current + dt * 0.04 * speed) % 1;
       force(v => (v + 1) % 1_000_000);
       raf = requestAnimationFrame(loop);
     };
@@ -149,7 +149,9 @@ function TrackMap({
     positions.length > 0
       ? [...positions].sort((a, b) => (a.position || 99) - (b.position || 99))
       : drivers.slice(0, 20).map((d, i) => ({ driver_number: d.number, position: i + 1 }));
-  const gridGap = 0.012; // fraction of lap between cars
+  // small leader-to-tail spread so the field is strung out but distinct,
+  // not bunched into one corner
+  const spread = 0.55;
 
   return (
     <div className="relative">
@@ -163,7 +165,8 @@ function TrackMap({
         </>}
         {total > 0 && ordered.map((pos, idx) => {
           const driver = drivers.find(dr => dr.number === pos.driver_number);
-          const frac = (progress.current - idx * gridGap + 1) % 1;
+          const offset = ordered.length > 1 ? (idx / ordered.length) * spread : 0;
+          const frac = (progress.current - offset + 1) % 1;
           const pt = path!.getPointAtLength(frac * total);
           const color = driver ? getTeamColor(driver.team) : '#888';
           const isSel = selectedDrivers.includes(pos.driver_number);
@@ -361,7 +364,11 @@ export function TelemetryTab() {
           </div>
           <TrackMap outline={outline} positions={positions} drivers={drivers}
             selectedDrivers={selectedDrivers} playing={playing} speed={speed}
-            sourceLabel={trackSource === 'telemetry' ? 'Live telemetry trace' : `${circuitId} · simulated shape`} />
+            sourceLabel={
+              trackSource === 'telemetry' ? 'Live telemetry trace'
+              : trackSource === 'circuit' ? `${circuitId} · real circuit`
+              : `${circuitId} · simulated shape`
+            } />
         </div>
 
         <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">

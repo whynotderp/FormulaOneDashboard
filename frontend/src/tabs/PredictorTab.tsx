@@ -1,17 +1,9 @@
 import { useEffect, useState } from 'react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
-import { predictRace } from '../api/client';
-import type { RacePrediction, PredictionResult } from '../api/client';
+import { predictRace, getSessions } from '../api/client';
+import type { RacePrediction, PredictionResult, Session } from '../api/client';
 import { LoadingSpinner, ErrorMessage } from '../components/LoadingSpinner';
 import { TeamBadge } from '../components/TeamBadge';
-
-const CIRCUITS = [
-  { id: 'bahrain', name: 'Bahrain' }, { id: 'jeddah', name: 'Saudi Arabia (Jeddah)' },
-  { id: 'melbourne', name: 'Australia (Melbourne)' }, { id: 'miami', name: 'Miami' },
-  { id: 'monaco', name: 'Monaco' }, { id: 'silverstone', name: 'Great Britain (Silverstone)' },
-  { id: 'spa', name: 'Belgium (Spa)' }, { id: 'monza', name: 'Italy (Monza)' },
-  { id: 'suzuka', name: 'Japan (Suzuka)' }, { id: 'interlagos', name: 'Brazil (Interlagos)' },
-];
 
 const FALLBACK: RacePrediction = {
   circuit: 'bahrain', weather: 'dry',
@@ -76,20 +68,32 @@ function Gauge({ label, value, color }: { label: string; value: number; color: s
 }
 
 export function PredictorTab() {
-  const [circuit, setCircuit] = useState('bahrain');
+  const [races, setRaces] = useState<Session[]>([]);
+  const [sessionKey, setSessionKey] = useState<number | undefined>(undefined);
   const [weather, setWeather] = useState<'dry' | 'wet'>('dry');
   const [prediction, setPrediction] = useState<RacePrediction>(FALLBACK);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const run = async () => {
+  // Load the full season race calendar (all Grands Prix), newest first.
+  useEffect(() => {
+    getSessions()
+      .then(r => {
+        const racesOnly = r.data.filter(s => (s.session_type || s.session_name) === 'Race');
+        setRaces(racesOnly);
+        if (racesOnly.length > 0) setSessionKey(racesOnly[0].session_key);
+      })
+      .catch(() => {});
+  }, []);
+
+  const run = async (sk = sessionKey) => {
     setLoading(true); setError(null);
     try {
-      const r = await predictRace(circuit, weather);
+      const r = await predictRace('bahrain', weather, sk);
       setPrediction(r.data);
     } catch {
       setError('Backend not running — showing sample prediction');
-      setPrediction({ ...FALLBACK, circuit, weather });
+      setPrediction({ ...FALLBACK, weather });
     } finally { setLoading(false); }
   };
 
@@ -101,10 +105,15 @@ export function PredictorTab() {
     <div className="space-y-4">
       <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4 flex flex-wrap gap-4 items-center">
         <div className="flex items-center gap-2">
-          <label className="text-xs text-[#6b7280] uppercase tracking-wider">Circuit</label>
-          <select className="bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] rounded px-3 py-1.5 text-sm"
-            value={circuit} onChange={e => setCircuit(e.target.value)}>
-            {CIRCUITS.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          <label className="text-xs text-[#6b7280] uppercase tracking-wider">Race</label>
+          <select className="bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] rounded px-3 py-1.5 text-sm max-w-xs"
+            value={sessionKey ?? ''} onChange={e => setSessionKey(Number(e.target.value))}>
+            {races.length === 0 && <option value="">No live calendar — using sample</option>}
+            {races.map(s => (
+              <option key={s.session_key} value={s.session_key}>
+                {s.country_name} ({s.date_start?.slice(0, 10)})
+              </option>
+            ))}
           </select>
         </div>
         <div className="flex items-center gap-2">
@@ -118,13 +127,20 @@ export function PredictorTab() {
             ))}
           </div>
         </div>
-        <button onClick={run} disabled={loading}
+        <button onClick={() => run()} disabled={loading}
           className="ml-auto px-6 py-2 bg-[#e10600] text-white rounded font-semibold text-sm hover:bg-red-700 transition-colors disabled:opacity-50">
           {loading ? 'Calculating...' : '⚡ Run Prediction'}
         </button>
       </div>
 
       {error && <ErrorMessage message={error} />}
+      {!loading && (
+        <div className="text-xs text-[#6b7280]">
+          {prediction.grid_source === 'qualifying'
+            ? <span><span className="text-green-400">●</span> Grounded in the real starting grid / qualifying result for this race</span>
+            : <span><span className="text-yellow-400">●</span> No qualifying data for this race yet — grid modeled from team pace</span>}
+        </div>
+      )}
       {loading && <LoadingSpinner size="lg" />}
 
       {!loading && (
@@ -212,10 +228,10 @@ export function PredictorTab() {
             <h4 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider mb-3">Prediction Methodology</h4>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
               {[
-                { factor: 'Qualifying Position', weight: '40%', color: '#e10600' },
+                { factor: 'Grid / Qualifying Position', weight: '45%', color: '#e10600' },
                 { factor: 'Team Pace', weight: '25%', color: '#f59e0b' },
                 { factor: 'Recent Form (last 5 races)', weight: '20%', color: '#22c55e' },
-                { factor: 'Circuit Performance', weight: '15%', color: '#3b82f6' },
+                { factor: 'Circuit Performance', weight: '10%', color: '#3b82f6' },
               ].map(f => (
                 <div key={f.factor} className="flex flex-col gap-1">
                   <span style={{ color: f.color }} className="font-bold text-base">{f.weight}</span>

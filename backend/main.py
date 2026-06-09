@@ -4,6 +4,7 @@ Uses OpenF1 API, Ergast API, and FastF1 library
 """
 
 import datetime
+import hashlib
 import math
 import random
 from typing import Any, Dict, List, Optional
@@ -25,17 +26,33 @@ app.add_middleware(
 )
 
 OPENF1_BASE = "https://api.openf1.org/v1"
-ERGAST_BASE = "http://ergast.com/api/f1"
+# Ergast (ergast.com) is deprecated and now 301-redirects; Jolpica is the
+# maintained drop-in successor with the same response schema.
+ERGAST_BASE = "https://api.jolpi.ca/ergast/f1"
 
 
-async def fetch_json(client: httpx.AsyncClient, url: str, params: Dict = None) -> Any:
-    try:
-        r = await client.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print(f"[FETCH ERROR] {url}: {e}")
-        return None
+async def fetch_json(client: httpx.AsyncClient, url: str, params: Dict = None,
+                     retries: int = 3) -> Any:
+    """GET JSON, following redirects and backing off on 429 rate limits."""
+    import asyncio
+    for attempt in range(retries):
+        try:
+            r = await client.get(url, params=params, timeout=20, follow_redirects=True)
+            if r.status_code == 429 and attempt < retries - 1:
+                await asyncio.sleep(0.6 * (attempt + 1))
+                continue
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code == 429 and attempt < retries - 1:
+                await asyncio.sleep(0.6 * (attempt + 1))
+                continue
+            print(f"[FETCH ERROR] {url}: {e}")
+            return None
+        except Exception as e:
+            print(f"[FETCH ERROR] {url}: {e}")
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +134,44 @@ DRIVERS_2025 = [
     {"code": "ALB", "name": "Alexander Albon",     "team": "Williams",     "price": 11.0, "number": 23},
     {"code": "HAD", "name": "Isack Hadjar",        "team": "Racing Bulls", "price": 8.5,  "number": 6},
 ]
+
+PRICE_BY_CODE = {d["code"]: d["price"] for d in DRIVERS_2025}
+
+
+def normalize_drivers(raw: List[Dict]) -> List[Dict]:
+    """Map OpenF1's /drivers schema (name_acronym, full_name, team_name,
+    driver_number) into the schema the frontend expects (code, name, team,
+    number, price). De-dupes by driver number."""
+    out: List[Dict] = []
+    seen = set()
+    for d in raw:
+        num = d.get("driver_number")
+        if num is None or num in seen:
+            continue
+        seen.add(num)
+        code = (d.get("name_acronym")
+                or (d.get("last_name") or d.get("full_name") or "").strip()[:3].upper()
+                or str(num))
+        name = (d.get("full_name")
+                or f"{d.get('first_name', '')} {d.get('last_name', '')}".strip()
+                or code)
+        out.append({
+            "code": code,
+            "name": name.title() if name.isupper() else name,
+            "team": d.get("team_name") or "Unknown",
+            "team_colour": (f"#{d['team_colour']}" if d.get("team_colour") else None),
+            "number": num,
+            "price": PRICE_BY_CODE.get(code, 5.0),
+        })
+    return out
+
+
+def _to_float(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
 
 CONSTRUCTORS_2025 = [
     {"name": "McLaren",      "price": 33.5},
@@ -204,7 +259,9 @@ async def get_drivers(session_key: Optional[int] = None):
         async with httpx.AsyncClient() as client:
             data = await fetch_json(client, f"{OPENF1_BASE}/drivers", {"session_key": session_key})
             if data:
-                return data
+                drivers = normalize_drivers(data)
+                if drivers:
+                    return drivers
     return DRIVERS_2025
 
 
@@ -258,9 +315,29 @@ async def get_car_data(session_key: int, driver_number: int):
 @app.get("/api/positions")
 async def get_positions(session_key: int):
     async with httpx.AsyncClient() as client:
-        data = await fetch_json(client, f"{OPENF1_BASE}/intervals", {"session_key": session_key})
-        if data:
-            return data
+        pos_data = await fetch_json(client, f"{OPENF1_BASE}/position", {"session_key": session_key})
+        itv_data = await fetch_json(client, f"{OPENF1_BASE}/intervals", {"session_key": session_key})
+    if pos_data:
+        # /position is time-ordered; the last entry per driver is the latest standing
+        latest_pos: Dict[int, int] = {}
+        for p in pos_data:
+            dn = p.get("driver_number")
+            if dn is not None and p.get("position") is not None:
+                latest_pos[dn] = p["position"]
+        latest_gap: Dict[int, Dict] = {}
+        for x in (itv_data or []):
+            dn = x.get("driver_number")
+            if dn is not None:
+                latest_gap[dn] = x
+        result = [{
+            "driver_number": dn,
+            "position": position,
+            "gap_to_leader": _to_float(latest_gap.get(dn, {}).get("gap_to_leader")),
+            "interval": _to_float(latest_gap.get(dn, {}).get("interval")),
+        } for dn, position in latest_pos.items()]
+        result.sort(key=lambda r: r["position"])
+        if result:
+            return result
     return [
         {"driver_number": d["number"], "position": i + 1,
          "gap_to_leader": round(i * 1.8 + random.gauss(0, 0.2), 3) if i > 0 else 0,
@@ -352,13 +429,53 @@ def _mock_outline(circuit_id: str, span: float = 1000.0, n: int = 240) -> List[D
     return _normalize_points(raw, span=span)
 
 
+# Real circuit geometry from the open f1-circuits dataset (LineString lon/lat
+# per track). Fetched once and cached in memory.
+F1_CIRCUITS_URL = "https://raw.githubusercontent.com/bacinger/f1-circuits/master/f1-circuits.geojson"
+_CIRCUITS_CACHE: Optional[Dict] = None
+# circuit_id -> substring to match against the dataset's Name/Location
+CIRCUIT_NAME_HINTS = {
+    "bahrain": "bahrain", "jeddah": "jedda", "melbourne": "albert park",
+    "miami": "miami", "monaco": "monaco", "silverstone": "silverstone",
+    "spa": "spa", "monza": "monza", "suzuka": "suzuka", "interlagos": "interlagos",
+}
+
+
+async def _load_circuit_geojson(client: httpx.AsyncClient) -> Dict:
+    global _CIRCUITS_CACHE
+    if _CIRCUITS_CACHE is None:
+        data = await fetch_json(client, F1_CIRCUITS_URL)
+        _CIRCUITS_CACHE = data or {}
+    return _CIRCUITS_CACHE
+
+
+def _circuit_outline_from_geojson(geo: Dict, circuit_id: str) -> Optional[List[Dict]]:
+    hint = CIRCUIT_NAME_HINTS.get(circuit_id, circuit_id).lower()
+    for feat in geo.get("features", []):
+        props = feat.get("properties", {})
+        label = f"{props.get('Name', '')} {props.get('Location', '')}".lower()
+        if hint and hint in label:
+            geom = feat.get("geometry", {})
+            coords = geom.get("coordinates", [])
+            if geom.get("type") == "MultiLineString":
+                coords = max(coords, key=len) if coords else []
+            if not coords or not isinstance(coords[0], (list, tuple)):
+                continue
+            lat0 = coords[0][1]
+            # equirectangular projection: compress longitude by cos(latitude)
+            raw = [{"x": c[0] * math.cos(math.radians(lat0)), "y": c[1]} for c in coords]
+            if len(raw) > 20:
+                return _normalize_points(raw)
+    return None
+
+
 @app.get("/api/track_outline")
 async def get_track_outline(session_key: Optional[int] = None,
                             driver_number: Optional[int] = None,
                             circuit_id: str = "bahrain"):
-    """Return the real circuit outline traced from OpenF1 /location telemetry
-    (one reference driver, sampled over a short window). Falls back to a
-    generated circuit-like curve when live data is unavailable. Points are
+    """Circuit outline, best source first: (1) real OpenF1 /location telemetry
+    trace for the session, (2) real geometry from the f1-circuits dataset for
+    the chosen circuit, (3) a generated circuit-like curve. Points are
     normalized into a 0..1000 square viewBox; cars animate along this outline."""
     if session_key:
         async with httpx.AsyncClient() as client:
@@ -381,6 +498,13 @@ async def get_track_outline(session_key: Optional[int] = None,
                 norm = _normalize_points(pts)
                 return {"source": "telemetry", "session_key": session_key,
                         "viewBox": "0 0 1000 1000", "points": norm}
+    # real circuit geometry from the open dataset
+    async with httpx.AsyncClient() as client:
+        geo = await _load_circuit_geojson(client)
+    real = _circuit_outline_from_geojson(geo, circuit_id) if geo else None
+    if real:
+        return {"source": "circuit", "circuit_id": circuit_id,
+                "viewBox": "0 0 1000 1000", "points": real}
     return {"source": "generated", "circuit_id": circuit_id,
             "viewBox": "0 0 1000 1000", "points": _mock_outline(circuit_id)}
 
@@ -389,70 +513,132 @@ async def get_track_outline(session_key: Optional[int] = None,
 # Race Predictor
 # ---------------------------------------------------------------------------
 
-def driver_score(driver: Dict, quali_pos: int, circuit_id: str, recent_form: List[int]) -> float:
-    pace_factor = TEAM_PACE.get(driver["team"], 1.04)
-    form_avg = sum(recent_form) / len(recent_form) if recent_form else 10.0
-    random.seed(hash(driver["code"] + circuit_id))
-    circuit_factor = random.uniform(0.8, 1.2)
-    random.seed()
-    return 0.40 * quali_pos + 0.25 * (pace_factor - 1.0) * 200 + 0.20 * form_avg + 0.15 * circuit_factor * 10
+def _stable_unit(s: str) -> float:
+    """Deterministic 0..1 value from a string (replaces reseeding random)."""
+    return (int(hashlib.md5(s.encode()).hexdigest()[:8], 16) % 10000) / 10000.0
+
+
+def _match_circuit(name: Optional[str]) -> str:
+    n = (name or "").lower()
+    for cid, hint in CIRCUIT_NAME_HINTS.items():
+        if (hint and hint in n) or cid in n:
+            return cid
+    return "bahrain"
+
+
+async def _real_grid(client: httpx.AsyncClient, session_key: int,
+                     meeting_key: Optional[int] = None) -> Dict[int, int]:
+    """Real starting grid for a race session: prefer /starting_grid, then fall
+    back to the qualifying session's final classification."""
+    grid: Dict[int, int] = {}
+    sg = await fetch_json(client, f"{OPENF1_BASE}/starting_grid", {"session_key": session_key})
+    for g in (sg or []):
+        dn, pos = g.get("driver_number"), g.get("position")
+        if dn is not None and pos is not None:
+            grid[dn] = pos
+    if grid:
+        return grid
+    if meeting_key:
+        siblings = await fetch_json(client, f"{OPENF1_BASE}/sessions", {"meeting_key": meeting_key})
+        qkey = next((s.get("session_key") for s in (siblings or [])
+                     if "Qualifying" in (s.get("session_name") or "")), None)
+        if qkey:
+            qpos = await fetch_json(client, f"{OPENF1_BASE}/position", {"session_key": qkey})
+            for p in (qpos or []):
+                dn, pos = p.get("driver_number"), p.get("position")
+                if dn is not None and pos is not None:
+                    grid[dn] = pos  # time-ordered, last wins = final quali order
+    return grid
 
 
 @app.get("/api/predictor/race")
-async def predict_race(circuit_id: str = "bahrain", weather: str = "dry"):
+async def predict_race(circuit_id: str = "bahrain", weather: str = "dry",
+                       session_key: Optional[int] = None):
+    """Predict the finishing order. When a session_key is given, the prediction
+    is grounded in that race's real starting grid (or qualifying result) and the
+    actual entry list; otherwise it builds a deterministic grid from team pace.
+    Scoring blends grid position, team pace, recent form and a circuit factor."""
+    weather_mult = 1.3 if weather == "wet" else 1.0
+    drivers = DRIVERS_2025
+    grid: Dict[int, int] = {}
+    grid_source = "model"
+
+    async with httpx.AsyncClient() as client:
+        if session_key:
+            sess = await fetch_json(client, f"{OPENF1_BASE}/sessions", {"session_key": session_key})
+            meeting_key = sess[0].get("meeting_key") if sess else None
+            if sess:
+                circuit_id = _match_circuit(sess[0].get("circuit_short_name"))
+            dr = await fetch_json(client, f"{OPENF1_BASE}/drivers", {"session_key": session_key})
+            nd = normalize_drivers(dr) if dr else []
+            if nd:
+                drivers = nd
+            grid = await _real_grid(client, session_key, meeting_key)
+            if grid:
+                grid_source = "qualifying"
+        # recent form: finishing positions over the last 5 races of the prior season
+        form: Dict[str, List[int]] = {}
+        ergast = await fetch_json(client, f"{ERGAST_BASE}/{CURRENT_YEAR - 1}/results.json", {"limit": 500})
+        if ergast:
+            try:
+                for race in ergast["MRData"]["RaceTable"]["Races"][-5:]:
+                    for res in race.get("Results", []):
+                        code = res.get("Driver", {}).get("code", "")
+                        if code:
+                            form.setdefault(code, []).append(int(res.get("position", 10)))
+            except Exception:
+                pass
+
     if circuit_id not in CIRCUIT_INCIDENTS:
         circuit_id = "bahrain"
     incidents = CIRCUIT_INCIDENTS[circuit_id]
-    weather_mult = 1.3 if weather == "wet" else 1.0
+    n = len(drivers)
 
-    form: Dict[str, List[int]] = {d["code"]: [] for d in DRIVERS_2025}
-    async with httpx.AsyncClient() as client:
-        ergast_data = await fetch_json(client, f"{ERGAST_BASE}/2024/results.json", {"limit": 100})
-    if ergast_data:
-        try:
-            for race in ergast_data["MRData"]["RaceTable"]["Races"][-5:]:
-                for result in race.get("Results", []):
-                    code = result.get("Driver", {}).get("code", "")
-                    if code in form:
-                        form[code].append(int(result.get("position", 10)))
-        except Exception:
-            pass
-
-    random.seed(hash(circuit_id + "quali"))
-    quali_order = list(range(1, 21))
-    random.shuffle(quali_order)
-    random.seed()
+    # No real grid (e.g. future race): synthesize a deterministic one from pace
+    if not grid:
+        pace_sorted = sorted(
+            drivers, key=lambda d: (TEAM_PACE.get(d["team"], 1.045), _stable_unit(d["code"] + circuit_id)))
+        grid = {d["number"]: i + 1 for i, d in enumerate(pace_sorted)}
 
     preds = []
-    for i, driver in enumerate(DRIVERS_2025):
-        q_pos = quali_order[i]
-        score = driver_score(driver, q_pos, circuit_id, form.get(driver["code"], [10]*5))
+    for d in drivers:
+        q = grid.get(d["number"], n)
+        pace = TEAM_PACE.get(d["team"], 1.045)
+        form_list = form.get(d["code"], [])
+        form_avg = sum(form_list) / len(form_list) if form_list else q
+        circuit_factor = (_stable_unit(d["code"] + circuit_id) - 0.5) * 2.0  # -1..1
+        score = (0.45 * q
+                 + 0.25 * ((pace - 1.0) * 250)
+                 + 0.20 * form_avg
+                 + 0.10 * (q + circuit_factor * 3))
         if weather == "wet":
-            score += random.gauss(0, 3)
-        crash = DRIVER_CRASH_PROB.get(driver["code"], 0.10) * weather_mult
-        preds.append({"driver": driver, "quali_pos": q_pos, "score": score, "crash": crash})
+            score += circuit_factor * 2.5  # wet shuffles the deck, deterministically
+        crash = DRIVER_CRASH_PROB.get(d["code"], 0.11) * weather_mult
+        preds.append({"driver": d, "quali": int(q), "score": score, "crash": crash})
 
     preds.sort(key=lambda x: x["score"])
     results = []
     for rank, p in enumerate(preds, 1):
-        conf = min(95, round(max(20, 95 - rank * 3.5 - abs(p["quali_pos"] - rank) * 2) + random.gauss(0, 3), 1))
+        delta = abs(p["quali"] - rank)
+        conf = round(max(20.0, min(96.0, 96 - rank * 2.8 - delta * 2.5)), 1)
         results.append({
             "predicted_position": rank,
             "driver_code": p["driver"]["code"],
             "driver_name": p["driver"]["name"],
             "team": p["driver"]["team"],
-            "quali_position": p["quali_pos"],
+            "quali_position": p["quali"],
             "confidence_pct": conf,
             "crash_probability_pct": round(min(0.99, p["crash"]) * 100, 1),
             "score": round(p["score"], 3),
         })
 
     return {
-        "circuit": circuit_id, "weather": weather, "predictions": results,
+        "circuit": circuit_id, "weather": weather, "grid_source": grid_source,
+        "predictions": results,
         "incident_probabilities": {
-            "safety_car":  round(incidents["sc"]       * weather_mult * 100, 1),
-            "virtual_sc":  round(incidents["vsc"]      * weather_mult * 100, 1),
-            "red_flag":    round(incidents["red_flag"] * weather_mult * 100, 1),
+            "safety_car":  round(min(99, incidents["sc"]       * weather_mult * 100), 1),
+            "virtual_sc":  round(min(99, incidents["vsc"]      * weather_mult * 100), 1),
+            "red_flag":    round(min(99, incidents["red_flag"] * weather_mult * 100), 1),
         },
         "podium": [r["driver_name"] for r in results[:3]],
     }
