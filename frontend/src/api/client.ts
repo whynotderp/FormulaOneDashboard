@@ -137,7 +137,22 @@ export interface Track {
   length_km: number;
 }
 
-export const getSessions = (year = 2025) => api.get<Session[]>('/api/sessions', { params: { year } });
+export interface TrackOutline {
+  source: 'telemetry' | 'generated';
+  viewBox: string;
+  points: { x: number; y: number; t?: string }[];
+  session_key?: number;
+  circuit_id?: string;
+}
+
+// No hardcoded year: backend defaults to the current season (and falls back
+// to the previous one early in the year).
+export const getSessions = (year?: number) =>
+  api.get<Session[]>('/api/sessions', { params: year ? { year } : {} });
+export const getTrackOutline = (sessionKey?: number, circuitId = 'bahrain', driverNumber?: number) =>
+  api.get<TrackOutline>('/api/track_outline', {
+    params: { session_key: sessionKey, circuit_id: circuitId, driver_number: driverNumber },
+  });
 export const getDrivers = (sessionKey?: number) => api.get<Driver[]>('/api/drivers', { params: { session_key: sessionKey } });
 export const getLaps = (sessionKey: number, driverNumber?: number) =>
   api.get<Lap[]>('/api/laps', { params: { session_key: sessionKey, driver_number: driverNumber } });

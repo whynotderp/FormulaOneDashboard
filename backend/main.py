@@ -3,9 +3,12 @@ F1 Telemetry Dashboard - FastAPI Backend
 Uses OpenF1 API, Ergast API, and FastF1 library
 """
 
+import datetime
 import math
 import random
 from typing import Any, Dict, List, Optional
+
+CURRENT_YEAR = datetime.date.today().year
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -175,16 +178,23 @@ CONSTRUCTOR_AVG_FANTASY_PTS = {
 # ---------------------------------------------------------------------------
 
 @app.get("/api/sessions")
-async def get_sessions(year: int = 2025):
+async def get_sessions(year: Optional[int] = None):
+    """Live sessions for a season. Defaults to the current year; if that season
+    has no data yet (early in the year), falls back to the previous season so the
+    dashboard always shows the most recent real sessions."""
     async with httpx.AsyncClient() as client:
-        data = await fetch_json(client, f"{OPENF1_BASE}/sessions", {"year": year})
-        if data:
-            return data
+        for y in [year] if year else [CURRENT_YEAR, CURRENT_YEAR - 1]:
+            data = await fetch_json(client, f"{OPENF1_BASE}/sessions", {"year": y})
+            if data:
+                # newest first so the frontend can auto-select the latest session
+                data.sort(key=lambda s: s.get("date_start", ""), reverse=True)
+                return data
+    # offline fallback (sample data)
     return [
-        {"session_key": 9574, "session_name": "Race", "date_start": "2025-03-16T15:00:00+00:00",
-         "circuit_short_name": "Bahrain", "country_name": "Bahrain", "year": 2025, "session_type": "Race"},
-        {"session_key": 9573, "session_name": "Qualifying", "date_start": "2025-03-15T14:00:00+00:00",
-         "circuit_short_name": "Bahrain", "country_name": "Bahrain", "year": 2025, "session_type": "Qualifying"},
+        {"session_key": 9999, "session_name": "Race", "date_start": f"{CURRENT_YEAR}-03-16T15:00:00+00:00",
+         "circuit_short_name": "Bahrain", "country_name": "Bahrain", "year": CURRENT_YEAR, "session_type": "Race"},
+        {"session_key": 9998, "session_name": "Qualifying", "date_start": f"{CURRENT_YEAR}-03-15T14:00:00+00:00",
+         "circuit_short_name": "Bahrain", "country_name": "Bahrain", "year": CURRENT_YEAR, "session_type": "Qualifying"},
     ]
 
 
@@ -308,6 +318,71 @@ async def get_track(track_id: str):
     if track_id not in TRACK_SVGS:
         raise HTTPException(404, "Track not found")
     return {**TRACK_SVGS[track_id], "id": track_id}
+
+
+def _normalize_points(raw: List[Dict], pad: float = 30.0, span: float = 1000.0) -> List[Dict]:
+    """Scale raw (x, y) telemetry into a clean square viewBox."""
+    xs = [p["x"] for p in raw]
+    ys = [p["y"] for p in raw]
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    w = max(maxx - minx, 1.0)
+    h = max(maxy - miny, 1.0)
+    scale = (span - 2 * pad) / max(w, h)
+    ox = pad + (span - 2 * pad - w * scale) / 2
+    oy = pad + (span - 2 * pad - h * scale) / 2
+    # flip Y: telemetry Y grows "up", SVG Y grows "down"
+    return [{"x": round(ox + (p["x"] - minx) * scale, 1),
+             "y": round(span - (oy + (p["y"] - miny) * scale), 1)} for p in raw]
+
+
+def _mock_outline(circuit_id: str, span: float = 1000.0, n: int = 240) -> List[Dict]:
+    """Generate a winding, circuit-like closed curve (not a plain polygon).
+    Seeded by circuit id so each track has a distinct, stable shape."""
+    seed = sum(ord(c) for c in circuit_id)
+    rnd = random.Random(seed)
+    a2, a3, b2, b3 = (rnd.uniform(0.25, 0.45), rnd.uniform(0.10, 0.25),
+                      rnd.uniform(0.20, 0.40), rnd.uniform(0.10, 0.22))
+    ph = rnd.uniform(0, math.pi)
+    raw = []
+    for i in range(n):
+        t = 2 * math.pi * i / n
+        x = math.cos(t) + a2 * math.cos(2 * t + ph) - a3 * math.sin(3 * t)
+        y = math.sin(t) + b2 * math.sin(2 * t + ph) + b3 * math.cos(3 * t)
+        raw.append({"x": x, "y": y})
+    return _normalize_points(raw, span=span)
+
+
+@app.get("/api/track_outline")
+async def get_track_outline(session_key: Optional[int] = None,
+                            driver_number: Optional[int] = None,
+                            circuit_id: str = "bahrain"):
+    """Return the real circuit outline traced from OpenF1 /location telemetry
+    (one reference driver, sampled over a short window). Falls back to a
+    generated circuit-like curve when live data is unavailable. Points are
+    normalized into a 0..1000 square viewBox; cars animate along this outline."""
+    if session_key:
+        async with httpx.AsyncClient() as client:
+            params = {"session_key": session_key}
+            if driver_number:
+                params["driver_number"] = driver_number
+            data = await fetch_json(client, f"{OPENF1_BASE}/location", params)
+        if data:
+            # pick a single driver's time-ordered samples (a few laps trace the shape)
+            if not driver_number:
+                first = data[0].get("driver_number")
+                data = [p for p in data if p.get("driver_number") == first]
+            pts = [{"x": p["x"], "y": p["y"], "t": p.get("date", "")}
+                   for p in data if p.get("x") is not None and (p.get("x") or p.get("y"))]
+            # drop the (0,0) garbage samples OpenF1 emits between laps
+            pts = [p for p in pts if not (p["x"] == 0 and p["y"] == 0)]
+            if len(pts) > 40:
+                step = max(1, len(pts) // 600)
+                pts = pts[::step][:600]
+                norm = _normalize_points(pts)
+                return {"source": "telemetry", "session_key": session_key,
+                        "viewBox": "0 0 1000 1000", "points": norm}
+    return {"source": "generated", "circuit_id": circuit_id,
+            "viewBox": "0 0 1000 1000", "points": _mock_outline(circuit_id)}
 
 
 # ---------------------------------------------------------------------------

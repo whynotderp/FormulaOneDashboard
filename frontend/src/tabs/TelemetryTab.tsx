@@ -1,13 +1,13 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   ResponsiveContainer, AreaChart, Area, ReferenceLine,
 } from 'recharts';
 import {
   getSessions, getDrivers, getLaps, getCarData, getStints,
-  getWeather, getRaceControl, getPositions, getTrack,
+  getWeather, getRaceControl, getPositions, getTrackOutline,
 } from '../api/client';
-import type { Session, Driver, Lap, CarData, Stint, Weather, RaceControl, Position, Track } from '../api/client';
+import type { Session, Driver, Lap, CarData, Stint, Weather, RaceControl, Position, TrackOutline } from '../api/client';
 import { LoadingSpinner, ErrorMessage } from '../components/LoadingSpinner';
 import { TeamBadge, getTeamColor } from '../components/TeamBadge';
 
@@ -68,11 +68,34 @@ const MOCK_RC: RaceControl[] = [
   { date: '2025-03-16T15:40:00+00:00', message: 'CHEQUERED FLAG', category: 'Flag', flag: 'CHEQUERED', lap_number: 57 },
 ];
 
-const MOCK_TRACK: Track = {
-  id: 'bahrain', name: 'Bahrain International Circuit', turns: 15, length_km: 5.412,
-  viewBox: '60 50 290 220',
-  path: 'M100,100 L200,70 L300,90 L330,160 L290,230 L200,250 L110,220 L80,150 Z',
-};
+// Client-side fallback outline: a winding, circuit-like closed curve seeded by
+// the circuit id, used when the backend / live telemetry is unavailable.
+function mockOutline(circuitId: string, n = 240): { x: number; y: number }[] {
+  let seed = 0;
+  for (const c of circuitId) seed += c.charCodeAt(0);
+  const rnd = () => { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; };
+  const a2 = 0.25 + rnd() * 0.2, a3 = 0.1 + rnd() * 0.15;
+  const b2 = 0.2 + rnd() * 0.2, b3 = 0.1 + rnd() * 0.12, ph = rnd() * Math.PI;
+  const raw = Array.from({ length: n }, (_, i) => {
+    const t = (2 * Math.PI * i) / n;
+    return {
+      x: Math.cos(t) + a2 * Math.cos(2 * t + ph) - a3 * Math.sin(3 * t),
+      y: Math.sin(t) + b2 * Math.sin(2 * t + ph) + b3 * Math.cos(3 * t),
+    };
+  });
+  const xs = raw.map(p => p.x), ys = raw.map(p => p.y);
+  const minx = Math.min(...xs), maxx = Math.max(...xs);
+  const miny = Math.min(...ys), maxy = Math.max(...ys);
+  const pad = 60, span = 1000;
+  const w = Math.max(maxx - minx, 1e-6), h = Math.max(maxy - miny, 1e-6);
+  const scale = (span - 2 * pad) / Math.max(w, h);
+  const ox = pad + (span - 2 * pad - w * scale) / 2;
+  const oy = pad + (span - 2 * pad - h * scale) / 2;
+  return raw.map(p => ({
+    x: Math.round((ox + (p.x - minx) * scale) * 10) / 10,
+    y: Math.round((span - (oy + (p.y - miny) * scale)) * 10) / 10,
+  }));
+}
 
 function formatLapTime(s: number): string {
   if (!s) return '-';
@@ -86,37 +109,84 @@ function CompoundBadge({ compound }: { compound: string }) {
   return <span className={`px-2 py-0.5 rounded text-xs font-bold ${cls[compound] || 'bg-gray-700 text-white'}`}>{compound[0]}</span>;
 }
 
-function TrackMap({ track, positions, drivers }: { track: Track; positions: Position[]; drivers: Driver[] }) {
-  const driverMap = Object.fromEntries(drivers.map(d => [d.number, d]));
+function TrackMap({
+  outline, positions, drivers, selectedDrivers, sourceLabel, playing, speed,
+}: {
+  outline: { x: number; y: number }[]; positions: Position[]; drivers: Driver[];
+  selectedDrivers: number[]; sourceLabel: string; playing: boolean; speed: number;
+}) {
+  const pathRef = useRef<SVGPathElement>(null);
+  const progress = useRef(0);
+  const [, force] = useState(0);
+
+  const d = outline.length
+    ? 'M' + outline.map(p => `${p.x},${p.y}`).join(' L ') + ' Z'
+    : '';
+
+  // rAF loop advances a shared lap progress; each car is offset by running order
+  useEffect(() => {
+    if (!playing || !d) return;
+    let raf = 0;
+    let last = performance.now();
+    const loop = (now: number) => {
+      const dt = (now - last) / 1000;
+      last = now;
+      progress.current = (progress.current + dt * 0.05 * speed) % 1;
+      force(v => (v + 1) % 1_000_000);
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [playing, speed, d]);
+
+  const path = pathRef.current;
+  const total = path ? path.getTotalLength() : 0;
+
+  // running order → evenly spaced cars that all orbit together.
+  // Fall back to the driver list if position data is missing (some live feeds
+  // omit it), so cars always appear on track.
+  const ordered: { driver_number: number; position: number }[] =
+    positions.length > 0
+      ? [...positions].sort((a, b) => (a.position || 99) - (b.position || 99))
+      : drivers.slice(0, 20).map((d, i) => ({ driver_number: d.number, position: i + 1 }));
+  const gridGap = 0.012; // fraction of lap between cars
+
   return (
     <div className="relative">
-      <svg viewBox={track.viewBox} className="w-full h-48">
-        <path d={track.path} fill="none" stroke="#2a2a2a" strokeWidth="12" strokeLinecap="round" strokeLinejoin="round" />
-        <path d={track.path} fill="none" stroke="#3a3a3a" strokeWidth="8" strokeLinecap="round" strokeLinejoin="round" />
-        <path d={track.path} fill="none" stroke="#e10600" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" strokeDasharray="6 300" />
-        {positions.slice(0, 10).map((pos, idx) => {
-          const angle = (idx / 20) * Math.PI * 2;
-          const vb = track.viewBox.split(' ').map(Number);
-          const cx = vb[0] + vb[2] * 0.5 + Math.cos(angle) * vb[2] * 0.32;
-          const cy = vb[1] + vb[3] * 0.5 + Math.sin(angle) * vb[3] * 0.32;
-          const driver = driverMap[pos.driver_number];
+      <svg viewBox="0 0 1000 1000" className="w-full" style={{ height: '320px' }}>
+        {d && <>
+          {/* track bed */}
+          <path d={d} ref={pathRef} fill="none" stroke="#2a2a2a" strokeWidth={42} strokeLinecap="round" strokeLinejoin="round" />
+          <path d={d} fill="none" stroke="#3a3a3a" strokeWidth={30} strokeLinecap="round" strokeLinejoin="round" />
+          {/* start/finish marker */}
+          <path d={d} fill="none" stroke="#e10600" strokeWidth={6} strokeLinecap="round" strokeDasharray="8 600" />
+        </>}
+        {total > 0 && ordered.map((pos, idx) => {
+          const driver = drivers.find(dr => dr.number === pos.driver_number);
+          const frac = (progress.current - idx * gridGap + 1) % 1;
+          const pt = path!.getPointAtLength(frac * total);
           const color = driver ? getTeamColor(driver.team) : '#888';
+          const isSel = selectedDrivers.includes(pos.driver_number);
           return (
-            <g key={pos.driver_number}>
-              <circle cx={cx} cy={cy} r={6} fill={color} opacity={0.85} />
-              <text x={cx} y={cy - 9} textAnchor="middle" fontSize="7" fill={color} fontWeight="bold">{driver?.code || pos.driver_number}</text>
+            <g key={pos.driver_number} opacity={isSel ? 1 : 0.55}>
+              <circle cx={pt.x} cy={pt.y} r={isSel ? 18 : 13} fill={color}
+                stroke={isSel ? '#fff' : 'none'} strokeWidth={isSel ? 3 : 0} />
+              <text x={pt.x} y={pt.y - 24} textAnchor="middle" fontSize={isSel ? 26 : 20}
+                fill={color} fontWeight="bold">{driver?.code || pos.driver_number}</text>
             </g>
           );
         })}
       </svg>
-      <div className="absolute top-2 left-2 text-[10px] text-[#6b7280]">{track.name} · {track.turns} turns · {track.length_km}km</div>
+      <div className="absolute top-2 left-2 text-[10px] text-[#6b7280]">
+        {sourceLabel}
+      </div>
     </div>
   );
 }
 
 export function TelemetryTab() {
   const [sessions, setSessions] = useState<Session[]>(MOCK_SESSIONS);
-  const [selectedSession, setSelectedSession] = useState<number>(9574);
+  const [selectedSession, setSelectedSession] = useState<number>(0);
   const [drivers, setDrivers] = useState<Driver[]>(MOCK_DRIVERS);
   const [selectedDrivers, setSelectedDrivers] = useState<number[]>([1, 4]);
   const [lapsData, setLapsData] = useState<Record<number, Lap[]>>({});
@@ -125,7 +195,11 @@ export function TelemetryTab() {
   const [weather, setWeather] = useState<Weather>(MOCK_WEATHER);
   const [raceControl, setRaceControl] = useState<RaceControl[]>(MOCK_RC);
   const [positions, setPositions] = useState<Position[]>([]);
-  const [track, setTrack] = useState<Track>(MOCK_TRACK);
+  const [circuitId, setCircuitId] = useState<string>('bahrain');
+  const [outline, setOutline] = useState<{ x: number; y: number }[]>(mockOutline('bahrain'));
+  const [trackSource, setTrackSource] = useState<TrackOutline['source']>('generated');
+  const [playing, setPlaying] = useState(true);
+  const [speed, setSpeed] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -142,11 +216,14 @@ export function TelemetryTab() {
     setPositions(mockPos);
   }, []);
 
-  // Try to fetch from backend; fall back to mock
+  // Fetch live sessions for the current season; auto-select the newest one.
   useEffect(() => {
     setLoading(true);
-    getSessions(2025)
-      .then(r => { setSessions(r.data); })
+    getSessions()
+      .then(r => {
+        setSessions(r.data);
+        if (r.data.length > 0) setSelectedSession(r.data[0].session_key); // backend returns newest first
+      })
       .catch(() => setError('Backend not available — showing mock data'))
       .finally(() => setLoading(false));
   }, []);
@@ -179,10 +256,22 @@ export function TelemetryTab() {
     getStints(selectedSession, selectedDrivers[0])
       .then(r => setStints(r.data))
       .catch(() => setStints(MOCK_STINTS));
-    getTrack('bahrain')
-      .then(r => setTrack(r.data))
-      .catch(() => {});
   }, [selectedSession, selectedDrivers]);
+
+  // Build the track outline from real telemetry when possible; else generate one.
+  useEffect(() => {
+    getTrackOutline(selectedSession || undefined, circuitId, selectedDrivers[0])
+      .then(r => {
+        if (r.data.points?.length > 10) {
+          setOutline(r.data.points);
+          setTrackSource(r.data.source);
+        } else {
+          setOutline(mockOutline(circuitId));
+          setTrackSource('generated');
+        }
+      })
+      .catch(() => { setOutline(mockOutline(circuitId)); setTrackSource('generated'); });
+  }, [selectedSession, circuitId]);
 
   const toggleDriver = useCallback((num: number) => {
     setSelectedDrivers(prev => prev.includes(num) ? prev.filter(d => d !== num) : prev.length < 5 ? [...prev, num] : prev);
@@ -235,9 +324,10 @@ export function TelemetryTab() {
           </select>
         </div>
         <div className="flex items-center gap-2">
-          <label className="text-xs text-[#6b7280] uppercase tracking-wider">Track</label>
+          <label className="text-xs text-[#6b7280] uppercase tracking-wider">Track shape</label>
           <select className="bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] rounded px-3 py-1.5 text-sm"
-            onChange={e => getTrack(e.target.value).then(r => setTrack(r.data)).catch(() => {})}>
+            value={circuitId}
+            onChange={e => setCircuitId(e.target.value)}>
             {['bahrain','jeddah','melbourne','miami','monaco','silverstone','spa','monza','suzuka','interlagos'].map(t => (
               <option key={t} value={t}>{t.charAt(0).toUpperCase() + t.slice(1)}</option>
             ))}
@@ -256,8 +346,22 @@ export function TelemetryTab() {
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
         <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
-          <h3 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider mb-3">Circuit Map</h3>
-          <TrackMap track={track} positions={positions} drivers={drivers} />
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider">Circuit Map</h3>
+            <div className="flex items-center gap-2">
+              <button onClick={() => setPlaying(p => !p)}
+                className="text-xs px-2 py-0.5 rounded bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] hover:border-[#e10600]">
+                {playing ? '⏸ Pause' : '▶ Play'}
+              </button>
+              <select value={speed} onChange={e => setSpeed(Number(e.target.value))}
+                className="text-xs bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] rounded px-1 py-0.5">
+                {[0.5, 1, 2, 4].map(s => <option key={s} value={s}>{s}x</option>)}
+              </select>
+            </div>
+          </div>
+          <TrackMap outline={outline} positions={positions} drivers={drivers}
+            selectedDrivers={selectedDrivers} playing={playing} speed={speed}
+            sourceLabel={trackSource === 'telemetry' ? 'Live telemetry trace' : `${circuitId} · simulated shape`} />
         </div>
 
         <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
