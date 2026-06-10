@@ -539,15 +539,14 @@ async def get_track_outline(session_key: Optional[int] = None,
 
 def _clean_trace(pts: List[Dict]) -> List[Dict]:
     """Drop outlier samples (GPS spikes, pit/in-lap detours) that would draw
-    stray spurs off the track: any point that jumps more than ~4x the median
-    step from the previous kept point."""
+    stray spurs off the track. Threshold is a fraction of the track's bounding
+    diagonal (robust to duplicate samples, unlike a median-step threshold)."""
     if len(pts) < 5:
         return pts
-    steps = [math.dist((pts[i - 1]["x"], pts[i - 1]["y"]), (pts[i]["x"], pts[i]["y"]))
-             for i in range(1, len(pts))]
-    ss = sorted(steps)
-    med = ss[len(ss) // 2] or 1.0
-    thr = med * 4.0
+    xs = [p["x"] for p in pts]
+    ys = [p["y"] for p in pts]
+    diag = math.hypot(max(xs) - min(xs), max(ys) - min(ys)) or 1.0
+    thr = diag * 0.12  # a normal step is tiny; a pit/glitch jump is large
     out = [pts[0]]
     for p in pts[1:]:
         if math.dist((out[-1]["x"], out[-1]["y"]), (p["x"], p["y"])) <= thr:
@@ -598,11 +597,66 @@ async def _reference_laps(client: httpx.AsyncClient, session_key: int):
     return ref, by_drv[ref]
 
 
+# per-session caches (stable within a session) to keep replay consistent and cut
+# request volume so scrubbing doesn't hit the OpenF1 rate limit
+_OUTLINE_CACHE: Dict[int, List[Dict]] = {}
+_DRIVERS_CACHE: Dict[int, List[Dict]] = {}
+_PIT_CACHE: Dict[int, List] = {}
+
+
+async def _session_drivers(client: httpx.AsyncClient, session_key: int) -> List[Dict]:
+    if session_key not in _DRIVERS_CACHE:
+        drv = await fetch_json(client, f"{OPENF1_BASE}/drivers", {"session_key": session_key})
+        nd = normalize_drivers(drv) if drv else []
+        if nd:
+            _DRIVERS_CACHE[session_key] = nd
+        return nd
+    return _DRIVERS_CACHE[session_key]
+
+
+async def _session_pits(client: httpx.AsyncClient, session_key: int) -> List:
+    if session_key not in _PIT_CACHE:
+        p = await fetch_json(client, f"{OPENF1_BASE}/pit", {"session_key": session_key})
+        if p is not None:
+            _PIT_CACHE[session_key] = p
+        return p or []
+    return _PIT_CACHE[session_key]
+
+
+async def _session_outline_raw(client: httpx.AsyncClient, session_key: int,
+                               ref: int, ref_laps: List[Dict]) -> List[Dict]:
+    """Raw (x, y) outline of the circuit for a session, computed once from the
+    reference driver's fastest green lap (a complete, no-pit lap) and cached so
+    the track shape is identical for every replayed lap."""
+    if session_key in _OUTLINE_CACHE:
+        return _OUTLINE_CACHE[session_key]
+    valid = [l for l in ref_laps
+             if l.get("lap_duration") and l.get("date_start") and not l.get("is_pit_out_lap")]
+    chosen = min(valid, key=lambda l: l["lap_duration"]) if valid else \
+        next((l for l in ref_laps if l.get("date_start")), None)
+    raw: List[Dict] = []
+    if chosen:
+        start = _parse_dt(chosen["date_start"])
+        end = start + datetime.timedelta(seconds=(chosen.get("lap_duration") or 110))
+        url = (f"{OPENF1_BASE}/location?session_key={session_key}&driver_number={ref}"
+               f"&date%3E={start.strftime('%Y-%m-%dT%H:%M:%S')}"
+               f"&date%3C={end.strftime('%Y-%m-%dT%H:%M:%S')}")
+        loc = await fetch_json(client, url)
+        pts = [{"x": p["x"], "y": p["y"]} for p in (loc or [])
+               if p.get("x") is not None and not (p["x"] == 0 and p["y"] == 0)]
+        raw = _clean_trace(pts)
+    if len(raw) > 20:          # never cache an empty/failed build — retry next call
+        _OUTLINE_CACHE[session_key] = raw
+    return raw
+
+
 @app.get("/api/replay_meta")
 async def get_replay_meta(session_key: int):
     """Lightweight: how many laps can be replayed for this session."""
     async with httpx.AsyncClient() as client:
         ref, ref_laps = await _reference_laps(client, session_key)
+        if ref is not None and ref_laps:
+            await _session_outline_raw(client, session_key, ref, ref_laps)  # warm cache
     return {"session_key": session_key, "total_laps": len(ref_laps),
             "has_replay": len(ref_laps) > 0}
 
@@ -637,14 +691,15 @@ async def get_replay(session_key: int, lap: int = 1):
         url = (f"{OPENF1_BASE}/location?session_key={session_key}"
                f"&date%3E={s_iso}&date%3C={e_iso}")
         loc = await fetch_json(client, url)
-        drv = await fetch_json(client, f"{OPENF1_BASE}/drivers", {"session_key": session_key})
-        pit = await fetch_json(client, f"{OPENF1_BASE}/pit", {"session_key": session_key})
+        drivers_norm = await _session_drivers(client, session_key)
+        pit = await _session_pits(client, session_key)
+        outline_raw = await _session_outline_raw(client, session_key, ref, ref_laps)
 
     if not loc:
         return {"source": "none", "lap": lap, "total_laps": total,
                 "viewBox": "0 0 1000 1000", "outline": [], "cars": [], "pits": []}
 
-    info = {d["number"]: d for d in (normalize_drivers(drv) if drv else [])}
+    info = {d["number"]: d for d in (drivers_norm or [])}
     span_s = max((end - start).total_seconds(), 1.0)
 
     # pit stops occurring during this lap window -> normalized time t in 0..1
@@ -677,9 +732,11 @@ async def get_replay(session_key: int, lap: int = 1):
     for dn in by_drv:
         by_drv[dn].sort(key=lambda q: q["t"])
 
-    # outline + shared transform from the reference driver's lap (the racing line)
-    ref_pts = _clean_trace(by_drv.get(ref) or max(by_drv.values(), key=len))
-    tf = _fit_transform(ref_pts)
+    # Stable, session-wide outline (cached) + a single shared transform fit to
+    # it; per-lap car positions reuse this transform so the shape never changes.
+    outline_src = outline_raw if len(outline_raw) > 20 else \
+        _clean_trace(by_drv.get(ref) or max(by_drv.values(), key=len))
+    tf = _fit_transform(outline_src)
 
     def _downsample(seq, n=120):
         if len(seq) <= n:
@@ -687,10 +744,10 @@ async def get_replay(session_key: int, lap: int = 1):
         step = len(seq) / n
         return [seq[int(k * step)] for k in range(n)]
 
-    outline = [{"x": tf(p["x"], p["y"])[0], "y": tf(p["x"], p["y"])[1]} for p in _downsample(ref_pts, 200)]
+    outline = [{"x": tf(p["x"], p["y"])[0], "y": tf(p["x"], p["y"])[1]} for p in _downsample(outline_src, 220)]
     cars = []
     for dn, seq in by_drv.items():
-        ds = _downsample(seq, 120)
+        ds = _downsample(_clean_trace(seq), 120)
         samples = [{"x": tf(p["x"], p["y"])[0], "y": tf(p["x"], p["y"])[1],
                     "t": round(p["t"], 4)} for p in ds]
         meta = info.get(dn, {})
