@@ -118,6 +118,25 @@ function CompoundBadge({ compound }: { compound: string }) {
   return <span className={`px-2 py-0.5 rounded text-xs font-bold ${cls[compound] || 'bg-gray-700 text-white'}`}>{compound[0]}</span>;
 }
 
+// Catmull-Rom spline -> smooth SVG path so the track reads like a real circuit
+// map instead of a jagged polyline.
+function smoothPath(pts: { x: number; y: number }[], closed: boolean): string {
+  const n = pts.length;
+  if (n < 3) return n ? 'M' + pts.map(p => `${p.x},${p.y}`).join(' L ') : '';
+  let d = `M ${pts[0].x},${pts[0].y} `;
+  const last = closed ? n : n - 1;
+  for (let i = 0; i < last; i++) {
+    const p0 = pts[(i - 1 + n) % n];
+    const p1 = pts[i];
+    const p2 = pts[(i + 1) % n];
+    const p3 = pts[(i + 2) % n];
+    const c1x = p1.x + (p2.x - p0.x) / 6, c1y = p1.y + (p2.y - p0.y) / 6;
+    const c2x = p2.x - (p3.x - p1.x) / 6, c2y = p2.y - (p3.y - p1.y) / 6;
+    d += `C ${c1x.toFixed(1)},${c1y.toFixed(1)} ${c2x.toFixed(1)},${c2y.toFixed(1)} ${p2.x},${p2.y} `;
+  }
+  return closed ? d + 'Z' : d;
+}
+
 // Linear-interpolate a car's position at normalized lap time p (0..1).
 function interpAt(samples: { x: number; y: number; t: number }[], p: number) {
   if (samples.length === 0) return null;
@@ -136,34 +155,30 @@ function interpAt(samples: { x: number; y: number; t: number }[], p: number) {
 
 function TrackMap({
   outline, replayCars, pits, positions, drivers, selectedDrivers, sourceLabel,
-  playing, speed, onLapComplete,
+  playing, speed, showSectors, onLapComplete,
 }: {
   outline: { x: number; y: number }[]; replayCars?: ReplayCar[]; pits?: PitStop[];
   positions: Position[]; drivers: Driver[]; selectedDrivers: number[];
-  sourceLabel: string; playing: boolean; speed: number; onLapComplete?: () => void;
+  sourceLabel: string; playing: boolean; speed: number; showSectors: boolean;
+  onLapComplete?: () => void;
 }) {
   const pathRef = useRef<SVGPathElement>(null);
   const progress = useRef(0);
   const [, force] = useState(0);
   const replay = !!(replayCars && replayCars.length > 0);
 
-  const d = outline.length
-    ? 'M' + outline.map(p => `${p.x},${p.y}`).join(' L ') + ' Z'
-    : '';
+  const d = smoothPath(outline, true);
 
-  // Split the real outline into the three timing sectors as a colored overlay.
+  // Split the real outline into the three timing sectors as a subtle overlay.
   const sectorColors = ['#fb923c', '#38bdf8', '#a78bfa'];
   const sectorLabels = ['S1', 'S2', 'S3'];
   const n = outline.length;
-  const sectors = n > 6 ? [0, 1, 2].map(k => {
+  const sectors = (showSectors && n > 6) ? [0, 1, 2].map(k => {
     const a = Math.floor((n * k) / 3);
     const b = Math.floor((n * (k + 1)) / 3);
     const seg = outline.slice(a, k === 2 ? n : b + 1);
     const mid = seg[Math.floor(seg.length / 2)] || seg[0];
-    return {
-      d: seg.length > 1 ? 'M' + seg.map(p => `${p.x},${p.y}`).join(' L ') : '',
-      color: sectorColors[k], label: sectorLabels[k], mid,
-    };
+    return { d: smoothPath(seg, false), color: sectorColors[k], label: sectorLabels[k], mid };
   }) : [];
 
   // Who is in the pit lane right now (replay): pit events near current lap time,
@@ -210,21 +225,20 @@ function TrackMap({
     <div className="relative">
       <svg viewBox="0 0 1000 1000" className="w-full" style={{ height: '340px' }}>
         {d && <>
-          {/* track bed */}
-          <path d={d} ref={pathRef} fill="none" stroke="#2a2a2a" strokeWidth={42} strokeLinecap="round" strokeLinejoin="round" />
-          {/* sector overlay (S1/S2/S3) on the real outline */}
-          {sectors.length === 3
-            ? sectors.map(s => s.d && (
-                <path key={s.label} d={s.d} fill="none" stroke={s.color} strokeWidth={28}
-                  strokeOpacity={0.5} strokeLinecap="round" strokeLinejoin="round" />
-              ))
-            : <path d={d} fill="none" stroke="#3a3a3a" strokeWidth={30} strokeLinecap="round" strokeLinejoin="round" />}
+          {/* track bed: dark outer kerb + clean grey surface */}
+          <path d={d} ref={pathRef} fill="none" stroke="#000" strokeWidth={40} strokeLinecap="round" strokeLinejoin="round" />
+          <path d={d} fill="none" stroke="#4b4b4b" strokeWidth={30} strokeLinecap="round" strokeLinejoin="round" />
+          {/* optional thin sector accent on top of the surface */}
+          {sectors.map(s => s.d && (
+            <path key={s.label} d={s.d} fill="none" stroke={s.color} strokeWidth={8}
+              strokeOpacity={0.9} strokeLinecap="round" strokeLinejoin="round" />
+          ))}
           {/* start/finish marker */}
-          <path d={d} fill="none" stroke="#e10600" strokeWidth={6} strokeLinecap="round" strokeDasharray="8 600" />
+          <path d={d} fill="none" stroke="#e10600" strokeWidth={6} strokeLinecap="round" strokeDasharray="6 400" />
           {/* sector labels */}
           {sectors.map(s => s.mid && (
-            <text key={s.label + '-l'} x={s.mid.x} y={s.mid.y} textAnchor="middle"
-              fontSize={15} fontWeight="bold" fill={s.color} stroke="#0f0f0f" strokeWidth={0.5}>{s.label}</text>
+            <text key={s.label + '-l'} x={s.mid.x} y={s.mid.y - 16} textAnchor="middle"
+              fontSize={15} fontWeight="bold" fill={s.color}>{s.label}</text>
           ))}
         </>}
 
@@ -306,6 +320,7 @@ export function TelemetryTab() {
   const [trackSource, setTrackSource] = useState<TrackOutline['source']>('generated');
   const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(1);
+  const [showSectors, setShowSectors] = useState(true);
   // lap replay
   const [totalLaps, setTotalLaps] = useState(0);
   const [currentLap, setCurrentLap] = useState(1);
@@ -523,6 +538,10 @@ export function TelemetryTab() {
                 className="text-xs px-2 py-0.5 rounded bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] hover:border-[#e10600]">
                 {playing ? '⏸ Pause' : '▶ Play'}
               </button>
+              <button onClick={() => setShowSectors(s => !s)}
+                className={`text-xs px-2 py-0.5 rounded bg-[#0f0f0f] border ${showSectors ? 'border-[#e10600] text-[#e5e5e5]' : 'border-[#2a2a2a] text-[#6b7280]'} hover:border-[#e10600]`}>
+                Sectors
+              </button>
               <select value={speed} onChange={e => setSpeed(Number(e.target.value))}
                 className="text-xs bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] rounded px-1 py-0.5">
                 {[0.5, 1, 2, 4].map(s => <option key={s} value={s}>{s}x</option>)}
@@ -545,7 +564,7 @@ export function TelemetryTab() {
           )}
 
           <TrackMap outline={outline} replayCars={replayCars} pits={pits} positions={positions} drivers={drivers}
-            selectedDrivers={selectedDrivers} playing={playing} speed={speed}
+            selectedDrivers={selectedDrivers} playing={playing} speed={speed} showSectors={showSectors}
             onLapComplete={handleLapComplete}
             sourceLabel={
               replayCars && replayCars.length > 0 ? `Replay · real positions · lap ${currentLap}`
