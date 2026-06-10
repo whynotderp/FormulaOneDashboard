@@ -470,11 +470,14 @@ async def _load_circuit_geojson(client: httpx.AsyncClient) -> Dict:
 
 
 def _circuit_outline_from_geojson(geo: Dict, circuit_id: str) -> Optional[List[Dict]]:
-    hint = CIRCUIT_NAME_HINTS.get(circuit_id, circuit_id).lower()
+    hint = CIRCUIT_NAME_HINTS.get(circuit_id, circuit_id).lower().strip()
+    generic = {"circuit", "international", "autodrome", "autodromo", "grand", "prix",
+               "speedway", "park", "street", "racing", "course", "raceway", "city"}
+    tokens = [t for t in hint.split() if len(t) > 3 and t not in generic]
     for feat in geo.get("features", []):
         props = feat.get("properties", {})
         label = f"{props.get('Name', '')} {props.get('Location', '')}".lower()
-        if hint and hint in label:
+        if hint and (hint in label or any(t in label for t in tokens)):
             geom = feat.get("geometry", {})
             coords = geom.get("coordinates", [])
             if geom.get("type") == "MultiLineString":
@@ -616,13 +619,29 @@ async def get_replay(session_key: int, lap: int = 1):
                f"&date%3E={s_iso}&date%3C={e_iso}")
         loc = await fetch_json(client, url)
         drv = await fetch_json(client, f"{OPENF1_BASE}/drivers", {"session_key": session_key})
+        pit = await fetch_json(client, f"{OPENF1_BASE}/pit", {"session_key": session_key})
 
     if not loc:
         return {"source": "none", "lap": lap, "total_laps": total,
-                "viewBox": "0 0 1000 1000", "outline": [], "cars": []}
+                "viewBox": "0 0 1000 1000", "outline": [], "cars": [], "pits": []}
 
     info = {d["number"]: d for d in (normalize_drivers(drv) if drv else [])}
     span_s = max((end - start).total_seconds(), 1.0)
+
+    # pit stops occurring during this lap window -> normalized time t in 0..1
+    pits = []
+    for p in (pit or []):
+        dt = _parse_dt(p.get("date"))
+        dn = p.get("driver_number")
+        if dt is None or dn is None or not (start <= dt <= end):
+            continue
+        pits.append({
+            "driver_number": dn,
+            "code": info.get(dn, {}).get("code", str(dn)),
+            "team": info.get(dn, {}).get("team", "Unknown"),
+            "t": round((dt - start).total_seconds() / span_s, 4),
+            "duration": p.get("pit_duration"),
+        })
 
     by_drv: Dict[int, List[Dict]] = {}
     for p in loc:
@@ -659,7 +678,7 @@ async def get_replay(session_key: int, lap: int = 1):
         cars.append({"driver_number": dn, "code": meta.get("code", str(dn)),
                      "team": meta.get("team", "Unknown"), "samples": samples})
     return {"source": "telemetry", "lap": lap, "total_laps": total,
-            "viewBox": "0 0 1000 1000", "outline": outline, "cars": cars}
+            "viewBox": "0 0 1000 1000", "outline": outline, "cars": cars, "pits": pits}
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend,
   ResponsiveContainer, AreaChart, Area, ReferenceLine,
@@ -8,11 +8,19 @@ import {
   getWeather, getRaceControl, getPositions, getTrackOutline,
   getReplayMeta, getReplay,
 } from '../api/client';
-import type { Session, Driver, Lap, CarData, Stint, Weather, RaceControl, Position, TrackOutline, ReplayCar } from '../api/client';
+import type { Session, Driver, Lap, CarData, Stint, Weather, RaceControl, Position, TrackOutline, ReplayCar, PitStop } from '../api/client';
 import { LoadingSpinner, ErrorMessage } from '../components/LoadingSpinner';
 import { TeamBadge, getTeamColor } from '../components/TeamBadge';
 
 const DRIVER_COLORS = ['#e10600','#27F4D2','#FF8000','#3671C6','#E8002D','#FF87BC','#229971','#64C4FF','#6692FF','#B6BABD'];
+
+// canonical ordering of sessions within a weekend (incl. sprint format)
+const SESSION_ORDER: Record<string, number> = {
+  'Practice 1': 1, 'Practice 2': 2, 'Practice 3': 3,
+  'Sprint Qualifying': 4, 'Sprint Shootout': 4, 'Sprint': 5,
+  'Qualifying': 6, 'Race': 7,
+};
+const sessionRank = (s: Session) => SESSION_ORDER[s.session_name] ?? 99;
 
 const MOCK_SESSIONS: Session[] = [
   { session_key: 9574, session_name: 'Race', date_start: '2025-03-16T15:00:00+00:00', circuit_short_name: 'Bahrain', country_name: 'Bahrain', year: 2025, session_type: 'Race' },
@@ -127,10 +135,10 @@ function interpAt(samples: { x: number; y: number; t: number }[], p: number) {
 }
 
 function TrackMap({
-  outline, replayCars, positions, drivers, selectedDrivers, sourceLabel,
+  outline, replayCars, pits, positions, drivers, selectedDrivers, sourceLabel,
   playing, speed, onLapComplete,
 }: {
-  outline: { x: number; y: number }[]; replayCars?: ReplayCar[];
+  outline: { x: number; y: number }[]; replayCars?: ReplayCar[]; pits?: PitStop[];
   positions: Position[]; drivers: Driver[]; selectedDrivers: number[];
   sourceLabel: string; playing: boolean; speed: number; onLapComplete?: () => void;
 }) {
@@ -142,6 +150,27 @@ function TrackMap({
   const d = outline.length
     ? 'M' + outline.map(p => `${p.x},${p.y}`).join(' L ') + ' Z'
     : '';
+
+  // Pit lane: offset a slice of the track near the start/finish line inward
+  // toward the track centroid (representational — real pit-lane geometry isn't
+  // in the open data).
+  const cx0 = outline.length ? outline.reduce((s, p) => s + p.x, 0) / outline.length : 500;
+  const cy0 = outline.length ? outline.reduce((s, p) => s + p.y, 0) / outline.length : 500;
+  const pitSlice = outline.slice(0, Math.max(2, Math.floor(outline.length * 0.16)));
+  const pitLane = pitSlice.map(p => {
+    const dx = cx0 - p.x, dy = cy0 - p.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const off = 60;
+    return { x: p.x + (dx / len) * off, y: p.y + (dy / len) * off };
+  });
+  const pitD = pitLane.length > 1 ? 'M' + pitLane.map(p => `${p.x},${p.y}`).join(' L ') : '';
+
+  // Who is in the pit lane right now (replay): pit events near current lap time,
+  // de-duplicated by driver (OpenF1 can emit multiple rows per stop).
+  const inPit = Array.from(
+    new Map((pits || [])
+      .filter(p => Math.abs(progress.current - p.t) < 0.10)
+      .map(p => [p.driver_number, p])).values());
 
   // reset playback to the start of a lap whenever new replay data arrives
   useEffect(() => { progress.current = 0; }, [replayCars]);
@@ -183,6 +212,13 @@ function TrackMap({
           <path d={d} ref={pathRef} fill="none" stroke="#2a2a2a" strokeWidth={42} strokeLinecap="round" strokeLinejoin="round" />
           <path d={d} fill="none" stroke="#3a3a3a" strokeWidth={30} strokeLinecap="round" strokeLinejoin="round" />
           <path d={d} fill="none" stroke="#e10600" strokeWidth={6} strokeLinecap="round" strokeDasharray="8 600" />
+          {/* pit lane */}
+          {pitD && <>
+            <path d={pitD} fill="none" stroke="#1f1f1f" strokeWidth={16} strokeLinecap="round" strokeLinejoin="round" />
+            <path d={pitD} fill="none" stroke="#facc15" strokeWidth={4} strokeLinecap="round" strokeLinejoin="round" strokeDasharray="10 8" />
+            <text x={pitLane[Math.floor(pitLane.length / 2)].x} y={pitLane[Math.floor(pitLane.length / 2)].y - 14}
+              textAnchor="middle" fontSize={16} fill="#facc15" fontWeight="bold">PIT</text>
+          </>}
         </>}
 
         {/* REPLAY: real car positions interpolated from telemetry */}
@@ -220,13 +256,36 @@ function TrackMap({
         })}
       </svg>
       <div className="absolute top-2 left-2 text-[10px] text-[#6b7280]">{sourceLabel}</div>
+
+      {/* In-pit-lane tracker (replay) */}
+      {replay && (
+        <div className="absolute bottom-2 right-2 bg-[#0f0f0f]/90 border border-[#2a2a2a] rounded p-2 text-xs min-w-[120px]">
+          <div className="text-[10px] text-[#facc15] font-semibold uppercase tracking-wider mb-1">In Pit Lane</div>
+          {inPit.length === 0
+            ? <div className="text-[#6b7280]">— empty —</div>
+            : <div className="flex flex-wrap gap-1">
+                {inPit.map(p => (
+                  <span key={p.driver_number} className="font-mono font-bold px-1.5 py-0.5 rounded"
+                    style={{ color: getTeamColor(p.team), background: '#1a1a1a' }}>{p.code}</span>
+                ))}
+              </div>}
+        </div>
+      )}
     </div>
   );
 }
 
+// pick a meeting's default session: the Race, else the latest-stage session
+function pickDefaultSession(list: Session[]): Session | undefined {
+  const race = list.find(s => s.session_name === 'Race');
+  return race || [...list].sort((a, b) => sessionRank(b) - sessionRank(a))[0];
+}
+
 export function TelemetryTab() {
   const [sessions, setSessions] = useState<Session[]>(MOCK_SESSIONS);
+  const [selectedMeeting, setSelectedMeeting] = useState<number | undefined>(undefined);
   const [selectedSession, setSelectedSession] = useState<number>(0);
+  const [pits, setPits] = useState<PitStop[]>([]);
   const [drivers, setDrivers] = useState<Driver[]>(MOCK_DRIVERS);
   const [selectedDrivers, setSelectedDrivers] = useState<number[]>([1, 4]);
   const [lapsData, setLapsData] = useState<Record<number, Lap[]>>({});
@@ -260,17 +319,45 @@ export function TelemetryTab() {
     setPositions(mockPos);
   }, []);
 
-  // Fetch live sessions for the current season; auto-select the newest one.
+  // Fetch live sessions; auto-select the newest meeting and its Race session.
   useEffect(() => {
     setLoading(true);
     getSessions()
       .then(r => {
         setSessions(r.data);
-        if (r.data.length > 0) setSelectedSession(r.data[0].session_key); // backend returns newest first
+        if (r.data.length > 0) {
+          const mk = r.data[0].meeting_key ?? -1; // newest first
+          setSelectedMeeting(mk);
+          const def = pickDefaultSession(r.data.filter(s => (s.meeting_key ?? -1) === mk));
+          if (def) setSelectedSession(def.session_key);
+        }
       })
       .catch(() => setError('Backend not available — showing mock data'))
       .finally(() => setLoading(false));
   }, []);
+
+  const meetings = useMemo(() => {
+    const seen = new Set<number>();
+    const out: { key: number; label: string }[] = [];
+    for (const s of sessions) {
+      const mk = s.meeting_key ?? -1;
+      if (seen.has(mk)) continue;
+      seen.add(mk);
+      out.push({ key: mk, label: `${s.country_name} (${s.date_start?.slice(0, 10)})` });
+    }
+    return out;
+  }, [sessions]);
+
+  const meetingSessions = useMemo(
+    () => sessions.filter(s => (s.meeting_key ?? -1) === selectedMeeting)
+      .sort((a, b) => sessionRank(a) - sessionRank(b)),
+    [sessions, selectedMeeting]);
+
+  // Track shape follows the selected session's circuit automatically.
+  useEffect(() => {
+    const s = sessions.find(x => x.session_key === selectedSession);
+    if (s?.circuit_short_name) setCircuitId(s.circuit_short_name.toLowerCase());
+  }, [selectedSession, sessions]);
 
   useEffect(() => {
     if (!selectedSession) return;
@@ -335,6 +422,7 @@ export function TelemetryTab() {
       .then(r => {
         if (r.data.cars?.length) {
           setReplayCars(r.data.cars);
+          setPits(r.data.pits || []);
           if (r.data.outline?.length) { setOutline(r.data.outline); setTrackSource('telemetry'); }
         }
       })
@@ -384,24 +472,25 @@ export function TelemetryTab() {
       {/* Controls */}
       <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4 flex flex-wrap gap-4 items-center">
         <div className="flex items-center gap-2">
+          <label className="text-xs text-[#6b7280] uppercase tracking-wider">Race</label>
+          <select className="bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] rounded px-3 py-1.5 text-sm max-w-[220px]"
+            value={selectedMeeting ?? ''}
+            onChange={e => {
+              const mk = Number(e.target.value);
+              setSelectedMeeting(mk);
+              const def = pickDefaultSession(sessions.filter(s => (s.meeting_key ?? -1) === mk));
+              if (def) setSelectedSession(def.session_key);
+            }}>
+            {meetings.map(m => <option key={m.key} value={m.key}>{m.label}</option>)}
+          </select>
+        </div>
+        <div className="flex items-center gap-2">
           <label className="text-xs text-[#6b7280] uppercase tracking-wider">Session</label>
           <select className="bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] rounded px-3 py-1.5 text-sm"
             value={selectedSession}
             onChange={e => setSelectedSession(Number(e.target.value))}>
-            {sessions.map(s => (
-              <option key={s.session_key} value={s.session_key}>
-                {s.country_name} — {s.session_name} ({s.date_start.slice(0, 10)})
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="flex items-center gap-2">
-          <label className="text-xs text-[#6b7280] uppercase tracking-wider">Track shape</label>
-          <select className="bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] rounded px-3 py-1.5 text-sm"
-            value={circuitId}
-            onChange={e => setCircuitId(e.target.value)}>
-            {['bahrain','jeddah','melbourne','miami','monaco','silverstone','spa','monza','suzuka','interlagos'].map(t => (
-              <option key={t} value={t}>{t.charAt(0).toUpperCase() + t.slice(1)}</option>
+            {meetingSessions.map(s => (
+              <option key={s.session_key} value={s.session_key}>{s.session_name}</option>
             ))}
           </select>
         </div>
@@ -448,7 +537,7 @@ export function TelemetryTab() {
             </div>
           )}
 
-          <TrackMap outline={outline} replayCars={replayCars} positions={positions} drivers={drivers}
+          <TrackMap outline={outline} replayCars={replayCars} pits={pits} positions={positions} drivers={drivers}
             selectedDrivers={selectedDrivers} playing={playing} speed={speed}
             onLapComplete={handleLapComplete}
             sourceLabel={

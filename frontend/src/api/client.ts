@@ -15,6 +15,7 @@ export interface Session {
   country_name: string;
   year: number;
   session_type: string;
+  meeting_key?: number;
 }
 
 export interface Driver {
@@ -161,6 +162,13 @@ export interface ReplayCar {
   team: string;
   samples: { x: number; y: number; t: number }[];
 }
+export interface PitStop {
+  driver_number: number;
+  code: string;
+  team: string;
+  t: number;
+  duration?: number | null;
+}
 export interface Replay {
   source: 'telemetry' | 'none';
   lap: number;
@@ -168,6 +176,7 @@ export interface Replay {
   viewBox: string;
   outline: { x: number; y: number }[];
   cars: ReplayCar[];
+  pits: PitStop[];
 }
 export const getReplayMeta = (sessionKey: number) =>
   api.get<{ session_key: number; total_laps: number; has_replay: boolean }>(
