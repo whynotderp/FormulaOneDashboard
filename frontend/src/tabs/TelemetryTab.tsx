@@ -239,11 +239,11 @@ function TrackMap({
     <div className="relative">
       <svg viewBox="0 0 1000 1000" className="w-full" style={{ height: '500px' }}>
         {d && <>
-          {/* track bed: dark outer kerb + clean grey surface */}
-          <path d={d} ref={pathRef} fill="none" stroke="#000" strokeWidth={40} strokeLinecap="round" strokeLinejoin="round" />
-          <path d={d} fill="none" stroke="#4b4b4b" strokeWidth={30} strokeLinecap="round" strokeLinejoin="round" />
+          {/* track bed: thin enough that adjacent sections keep their real gaps */}
+          <path d={d} ref={pathRef} fill="none" stroke="#000" strokeWidth={15} strokeLinecap="round" strokeLinejoin="round" />
+          <path d={d} fill="none" stroke="#5a5a5a" strokeWidth={9} strokeLinecap="round" strokeLinejoin="round" />
           {/* start/finish marker */}
-          <path d={d} fill="none" stroke="#e10600" strokeWidth={6} strokeLinecap="round" strokeDasharray="6 400" />
+          <path d={d} fill="none" stroke="#e10600" strokeWidth={5} strokeLinecap="round" strokeDasharray="5 400" />
           {/* sector-start indicators */}
           {sectors.map(s => (
             <g key={s.label}>
@@ -261,10 +261,10 @@ function TrackMap({
           const color = getTeamColor(car.team);
           const isSel = selectedDrivers.includes(car.driver_number);
           return (
-            <g key={car.driver_number} opacity={isSel ? 1 : 0.7}>
-              <circle cx={pt.x} cy={pt.y} r={isSel ? 17 : 12} fill={color}
-                stroke={isSel ? '#fff' : '#0f0f0f'} strokeWidth={isSel ? 3 : 1.5} />
-              <text x={pt.x} y={pt.y - 22} textAnchor="middle" fontSize={isSel ? 24 : 18}
+            <g key={car.driver_number} opacity={isSel ? 1 : 0.75}>
+              <circle cx={pt.x} cy={pt.y} r={isSel ? 13 : 9} fill={color}
+                stroke={isSel ? '#fff' : '#0f0f0f'} strokeWidth={isSel ? 2.5 : 1.5} />
+              <text x={pt.x} y={pt.y - 17} textAnchor="middle" fontSize={isSel ? 19 : 14}
                 fill={color} fontWeight="bold">{car.code}</text>
             </g>
           );
@@ -280,9 +280,9 @@ function TrackMap({
           const isSel = selectedDrivers.includes(pos.driver_number);
           return (
             <g key={pos.driver_number} opacity={isSel ? 1 : 0.55}>
-              <circle cx={pt.x} cy={pt.y} r={isSel ? 18 : 13} fill={color}
-                stroke={isSel ? '#fff' : 'none'} strokeWidth={isSel ? 3 : 0} />
-              <text x={pt.x} y={pt.y - 24} textAnchor="middle" fontSize={isSel ? 26 : 20}
+              <circle cx={pt.x} cy={pt.y} r={isSel ? 13 : 9} fill={color}
+                stroke={isSel ? '#fff' : 'none'} strokeWidth={isSel ? 2.5 : 0} />
+              <text x={pt.x} y={pt.y - 17} textAnchor="middle" fontSize={isSel ? 19 : 14}
                 fill={color} fontWeight="bold">{driver?.code || pos.driver_number}</text>
             </g>
           );
