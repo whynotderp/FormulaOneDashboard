@@ -174,17 +174,23 @@ function TrackMap({
   const sectorColors = ['#fb923c', '#38bdf8', '#a78bfa'];
   const sectorLabels = ['S1', 'S2', 'S3'];
   const n = outline.length;
+  const cx0 = n ? outline.reduce((s, p) => s + p.x, 0) / n : 500;
+  const cy0 = n ? outline.reduce((s, p) => s + p.y, 0) / n : 500;
   const sectors = (showSectors && n > 6) ? [0, 1, 2].map(k => {
     const idx = Math.floor((n * k) / 3);
     const p = outline[idx];
     const q = outline[(idx + 1) % n];
     const dx = q.x - p.x, dy = q.y - p.y;
     const len = Math.hypot(dx, dy) || 1;
-    const nx = -dy / len, ny = dx / len; // perpendicular to track direction
-    const L = 26;
+    const nx = -dy / len, ny = dx / len; // perpendicular to track direction (tick)
+    const L = 24;
+    // label sits outward from the track centre so it never overlaps the line
+    let ox = p.x - cx0, oy = p.y - cy0;
+    const olen = Math.hypot(ox, oy) || 1;
+    ox /= olen; oy /= olen;
     return {
       x1: p.x - nx * L, y1: p.y - ny * L, x2: p.x + nx * L, y2: p.y + ny * L,
-      lx: p.x + nx * (L + 14), ly: p.y + ny * (L + 14),
+      lx: p.x + ox * 46, ly: p.y + oy * 46,
       color: sectorColors[k], label: sectorLabels[k],
     };
   }) : [];
@@ -231,7 +237,7 @@ function TrackMap({
 
   return (
     <div className="relative">
-      <svg viewBox="0 0 1000 1000" className="w-full" style={{ height: '340px' }}>
+      <svg viewBox="0 0 1000 1000" className="w-full" style={{ height: '500px' }}>
         {d && <>
           {/* track bed: dark outer kerb + clean grey surface */}
           <path d={d} ref={pathRef} fill="none" stroke="#000" strokeWidth={40} strokeLinecap="round" strokeLinejoin="round" />
@@ -533,8 +539,7 @@ export function TelemetryTab() {
 
       {loading && <LoadingSpinner />}
 
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-        <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
+      <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider">
               Circuit Map {totalLaps > 0 && <span className="text-[#e5e5e5] normal-case">· Lap {currentLap}/{totalLaps}</span>}
@@ -578,8 +583,9 @@ export function TelemetryTab() {
               : trackSource === 'telemetry' ? 'Live telemetry trace'
               : `${circuitId} · simulated shape`
             } />
-        </div>
+      </div>
 
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
           <h3 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider mb-3">Drivers <span className="normal-case font-normal">(up to 5)</span></h3>
           <div className="space-y-1 max-h-52 overflow-y-auto">

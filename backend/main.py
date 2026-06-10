@@ -555,7 +555,7 @@ def _clean_trace(pts: List[Dict]) -> List[Dict]:
     return out
 
 
-def _fit_transform(points: List[Dict], pad: float = 50.0, span: float = 1000.0):
+def _fit_transform(points: List[Dict], pad: float = 30.0, span: float = 1000.0):
     """Build a transform that fits `points` into a square viewBox; reusable so
     the outline and every car use the same coordinate mapping."""
     xs = [p["x"] for p in points]
