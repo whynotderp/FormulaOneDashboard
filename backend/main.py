@@ -277,11 +277,9 @@ async def get_sessions(year: Optional[int] = None):
 async def get_drivers(session_key: Optional[int] = None):
     if session_key:
         async with httpx.AsyncClient() as client:
-            data = await fetch_json(client, f"{OPENF1_BASE}/drivers", {"session_key": session_key})
-            if data:
-                drivers = normalize_drivers(data)
-                if drivers:
-                    return drivers
+            drivers = await _session_drivers(client, session_key)  # cached on success
+        if drivers:
+            return drivers
     return DRIVERS_2025
 
 
@@ -579,22 +577,22 @@ def _parse_dt(s: str) -> Optional[datetime.datetime]:
 
 
 async def _reference_laps(client: httpx.AsyncClient, session_key: int):
-    """Return (reference_driver_number, ordered lap list) where the reference is
-    the driver who completed the most laps (the leader/finisher)."""
+    """Return (reference_driver_number, ref lap list, all-drivers lap dict). The
+    reference is the driver who completed the most laps (the leader/finisher)."""
     laps = await fetch_json(client, f"{OPENF1_BASE}/laps", {"session_key": session_key})
     if not laps:
-        return None, []
+        return None, [], {}
     by_drv: Dict[int, List[Dict]] = {}
     for l in laps:
         dn = l.get("driver_number")
         if dn is not None and l.get("date_start"):
             by_drv.setdefault(dn, []).append(l)
     if not by_drv:
-        return None, []
+        return None, [], {}
     for dn in by_drv:
         by_drv[dn].sort(key=lambda x: x.get("lap_number", 0))
     ref = max(by_drv, key=lambda dn: len(by_drv[dn]))
-    return ref, by_drv[ref]
+    return ref, by_drv[ref], by_drv
 
 
 # per-session caches (stable within a session) to keep replay consistent and cut
@@ -654,7 +652,7 @@ async def _session_outline_raw(client: httpx.AsyncClient, session_key: int,
 async def get_replay_meta(session_key: int):
     """Lightweight: how many laps can be replayed for this session."""
     async with httpx.AsyncClient() as client:
-        ref, ref_laps = await _reference_laps(client, session_key)
+        ref, ref_laps, _ = await _reference_laps(client, session_key)
         if ref is not None and ref_laps:
             await _session_outline_raw(client, session_key, ref, ref_laps)  # warm cache
     return {"session_key": session_key, "total_laps": len(ref_laps),
@@ -668,7 +666,7 @@ async def get_replay(session_key: int, lap: int = 1):
     returns the outline (the reference racing line) plus per-car position samples
     with a normalized time t in 0..1. All share one coordinate transform."""
     async with httpx.AsyncClient() as client:
-        ref, ref_laps = await _reference_laps(client, session_key)
+        ref, ref_laps, by_laps = await _reference_laps(client, session_key)
         if not ref_laps:
             return {"source": "none", "lap": 0, "total_laps": 0,
                     "viewBox": "0 0 1000 1000", "outline": [], "cars": []}
@@ -685,6 +683,16 @@ async def get_replay(session_key: int, lap: int = 1):
             end = _parse_dt(ref_laps[i + 1]["date_start"])
         else:
             end = start + datetime.timedelta(seconds=(cur.get("lap_duration") or 110))
+        # Final lap: extend the window until the last still-running car crosses
+        # the line, so the replay doesn't cut off when the leader finishes.
+        if lap >= total:
+            for dlaps in by_laps.values():
+                fin = dlaps[-1]
+                fs = _parse_dt(fin.get("date_start"))
+                if fs is not None:
+                    fe = fs + datetime.timedelta(seconds=(fin.get("lap_duration") or 130))
+                    if fe > end:
+                        end = fe
         # OpenF1 date filters: drop tz/fraction (a '+' in a query breaks it)
         s_iso = start.strftime("%Y-%m-%dT%H:%M:%S")
         e_iso = end.strftime("%Y-%m-%dT%H:%M:%S")
@@ -700,6 +708,13 @@ async def get_replay(session_key: int, lap: int = 1):
                 "viewBox": "0 0 1000 1000", "outline": [], "cars": [], "pits": []}
 
     info = {d["number"]: d for d in (drivers_norm or [])}
+    # Final lap: the fetch window is padded, but normalize to the actual last
+    # telemetry sample so the lap spans the real racing (cars reach the line at
+    # t≈1) instead of leaving dead air after the leader finishes.
+    if lap >= total:
+        sample_dts = [dt for dt in (_parse_dt(p.get("date")) for p in loc) if dt and dt > start]
+        if sample_dts:
+            end = max(sample_dts)
     span_s = max((end - start).total_seconds(), 1.0)
 
     # pit stops occurring during this lap window -> normalized time t in 0..1

@@ -155,12 +155,12 @@ function interpAt(samples: { x: number; y: number; t: number }[], p: number) {
 
 function TrackMap({
   outline, replayCars, pits, positions, drivers, selectedDrivers, sourceLabel,
-  playing, speed, showSectors, onLapComplete,
+  playing, speed, showSectors, atEnd, onLapComplete,
 }: {
   outline: { x: number; y: number }[]; replayCars?: ReplayCar[]; pits?: PitStop[];
   positions: Position[]; drivers: Driver[]; selectedDrivers: number[];
   sourceLabel: string; playing: boolean; speed: number; showSectors: boolean;
-  onLapComplete?: () => void;
+  atEnd?: boolean; onLapComplete?: () => void;
 }) {
   const pathRef = useRef<SVGPathElement>(null);
   const progress = useRef(0);
@@ -215,15 +215,17 @@ function TrackMap({
       const rate = (replay ? 0.085 : 0.04) * speed; // replay ~12s/lap at 1x
       let np = progress.current + dt * rate;
       if (np >= 1) {
-        if (replay && onLapComplete) { progress.current = 0; onLapComplete(); }
-        else { np %= 1; progress.current = np; }
+        if (replay && onLapComplete) {
+          if (atEnd) { progress.current = 1; onLapComplete(); }   // hold at the finish
+          else { progress.current = 0; onLapComplete(); }          // advance to next lap
+        } else { np %= 1; progress.current = np; }
       } else progress.current = np;
       force(v => (v + 1) % 1_000_000);
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [playing, speed, d, replay, onLapComplete]);
+  }, [playing, speed, d, replay, atEnd, onLapComplete]);
 
   const path = pathRef.current;
   const total = path ? path.getTotalLength() : 0;
@@ -395,15 +397,18 @@ export function TelemetryTab() {
 
   useEffect(() => {
     if (!selectedSession) return;
-    Promise.all([getDrivers(selectedSession), getWeather(selectedSession), getRaceControl(selectedSession), getPositions(selectedSession)])
-      .then(([dr, wr, rc, pos]) => {
+    // independent calls so one failure (e.g. a rate-limited endpoint) doesn't
+    // leave the others stale — which previously mismatched live positions
+    // against the fallback driver list.
+    getDrivers(selectedSession).then(dr => {
+      if (dr.data?.length) {
         setDrivers(dr.data);
-        setWeather(wr.data);
-        setRaceControl(rc.data);
-        setPositions(pos.data);
         setSelectedDrivers(dr.data.slice(0, 2).map((d: Driver) => d.number));
-      })
-      .catch(() => {});
+      }
+    }).catch(() => {});
+    getPositions(selectedSession).then(p => { if (p.data?.length) setPositions(p.data); }).catch(() => {});
+    getWeather(selectedSession).then(w => setWeather(w.data)).catch(() => {});
+    getRaceControl(selectedSession).then(rc => { if (rc.data?.length) setRaceControl(rc.data); }).catch(() => {});
   }, [selectedSession]);
 
   useEffect(() => {
@@ -464,8 +469,9 @@ export function TelemetryTab() {
   }, [selectedSession, totalLaps, currentLap]);
 
   const handleLapComplete = useCallback(() => {
-    setCurrentLap(l => (l >= totalLaps ? 1 : l + 1));
-  }, [totalLaps]);
+    if (currentLap >= totalLaps) { setPlaying(false); return; } // stay on final lap
+    setCurrentLap(l => l + 1);
+  }, [currentLap, totalLaps]);
 
   const toggleDriver = useCallback((num: number) => {
     setSelectedDrivers(prev => prev.includes(num) ? prev.filter(d => d !== num) : prev.length < 5 ? [...prev, num] : prev);
@@ -576,6 +582,7 @@ export function TelemetryTab() {
 
           <TrackMap outline={outline} replayCars={replayCars} pits={pits} positions={positions} drivers={drivers}
             selectedDrivers={selectedDrivers} playing={playing} speed={speed} showSectors={showSectors}
+            atEnd={totalLaps > 0 && currentLap >= totalLaps}
             onLapComplete={handleLapComplete}
             sourceLabel={
               replayCars && replayCars.length > 0 ? `Replay · real positions · lap ${currentLap}`
