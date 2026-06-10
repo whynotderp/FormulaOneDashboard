@@ -186,8 +186,8 @@ export const getReplay = (sessionKey: number, lap: number) =>
 export const getDrivers = (sessionKey?: number) => api.get<Driver[]>('/api/drivers', { params: { session_key: sessionKey } });
 export const getLaps = (sessionKey: number, driverNumber?: number) =>
   api.get<Lap[]>('/api/laps', { params: { session_key: sessionKey, driver_number: driverNumber } });
-export const getCarData = (sessionKey: number, driverNumber: number) =>
-  api.get<CarData[]>('/api/car_data', { params: { session_key: sessionKey, driver_number: driverNumber } });
+export const getCarData = (sessionKey: number, driverNumber: number, lap?: number) =>
+  api.get<CarData[]>('/api/car_data', { params: { session_key: sessionKey, driver_number: driverNumber, lap } });
 export const getStints = (sessionKey: number, driverNumber?: number) =>
   api.get<Stint[]>('/api/stints', { params: { session_key: sessionKey, driver_number: driverNumber } });
 export const getWeather = (sessionKey: number) =>

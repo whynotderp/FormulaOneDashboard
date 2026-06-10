@@ -420,13 +420,22 @@ export function TelemetryTab() {
           .catch(() => setLapsData(prev => ({ ...prev, [dn]: generateMockLaps(dn) })));
       }
     });
-    getCarData(selectedSession, selectedDrivers[0])
-      .then(r => setCarData(r.data))
-      .catch(() => setCarData(generateMockCarData()));
     getStints(selectedSession, selectedDrivers[0])
       .then(r => setStints(r.data))
       .catch(() => setStints(MOCK_STINTS));
   }, [selectedSession, selectedDrivers]);
+
+  // Speed/throttle/brake trace = the selected lap's on-track telemetry for the
+  // first selected driver (so it matches the replayed lap, not garage idle).
+  useEffect(() => {
+    if (!selectedSession || selectedDrivers.length === 0) return;
+    getCarData(selectedSession, selectedDrivers[0], totalLaps > 0 ? currentLap : undefined)
+      .then(r => {
+        const real = r.data?.filter(p => (p.speed || 0) > 0) || [];
+        setCarData(real.length > 10 ? r.data : generateMockCarData());
+      })
+      .catch(() => setCarData(generateMockCarData()));
+  }, [selectedSession, selectedDrivers, currentLap, totalLaps]);
 
   // Static outline (real circuit geometry or generated) — only when there's no
   // lap replay available; replay provides its own per-lap racing-line outline.
@@ -652,7 +661,9 @@ export function TelemetryTab() {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
-          <h3 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider mb-4">Speed Trace (km/h)</h3>
+          <h3 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider mb-4">
+            Speed Trace (km/h) <span className="normal-case font-normal text-[#4b5563]">· {drivers.find(d => d.number === selectedDrivers[0])?.code || ''}{totalLaps > 0 ? ` · lap ${currentLap}` : ''} · time →</span>
+          </h3>
           <ResponsiveContainer width="100%" height={180}>
             <AreaChart data={carData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />
@@ -666,7 +677,9 @@ export function TelemetryTab() {
         </div>
 
         <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
-          <h3 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider mb-4">Throttle / Brake</h3>
+          <h3 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider mb-4">
+            Throttle / Brake <span className="normal-case font-normal text-[#4b5563]">· {drivers.find(d => d.number === selectedDrivers[0])?.code || ''}{totalLaps > 0 ? ` · lap ${currentLap}` : ''} · time →</span>
+          </h3>
           <ResponsiveContainer width="100%" height={180}>
             <LineChart data={carData}>
               <CartesianGrid strokeDasharray="3 3" stroke="#2a2a2a" />

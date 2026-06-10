@@ -252,18 +252,27 @@ CONSTRUCTOR_AVG_FANTASY_PTS = {
 # Routes
 # ---------------------------------------------------------------------------
 
+_SESSIONS_CACHE: Dict[int, List] = {}
+
+
 @app.get("/api/sessions")
 async def get_sessions(year: Optional[int] = None):
     """Live sessions for a season. Defaults to the current year; if that season
-    has no data yet (early in the year), falls back to the previous season so the
-    dashboard always shows the most recent real sessions."""
+    has no data yet (early in the year), falls back to the previous season. The
+    largest successful response per year is cached so a transient partial/empty
+    OpenF1 response can't collapse the calendar to the offline fallback."""
     async with httpx.AsyncClient() as client:
         for y in [year] if year else [CURRENT_YEAR, CURRENT_YEAR - 1]:
             data = await fetch_json(client, f"{OPENF1_BASE}/sessions", {"year": y})
+            best = _SESSIONS_CACHE.get(y)
             if data:
-                # newest first so the frontend can auto-select the latest session
-                data.sort(key=lambda s: s.get("date_start", ""), reverse=True)
-                return data
+                data.sort(key=lambda s: s.get("date_start", ""), reverse=True)  # newest first
+                if not best or len(data) >= len(best):
+                    _SESSIONS_CACHE[y] = data
+                    best = data
+                return best
+            if best:        # fetch failed/partial -> serve the good cached list
+                return best
     # offline fallback (sample data)
     return [
         {"session_key": 9999, "session_name": "Race", "date_start": f"{CURRENT_YEAR}-03-16T15:00:00+00:00",
@@ -308,12 +317,35 @@ async def get_laps(session_key: int, driver_number: Optional[int] = None):
 
 
 @app.get("/api/car_data")
-async def get_car_data(session_key: int, driver_number: int):
-    params = {"session_key": session_key, "driver_number": driver_number}
+async def get_car_data(session_key: int, driver_number: int, lap: Optional[int] = None):
+    """On-track telemetry for a driver. With a lap number, returns that lap's
+    window (so the trace matches the replayed lap); otherwise returns the
+    session's moving samples, skipping the garage/standstill zeros at the start."""
     async with httpx.AsyncClient() as client:
-        data = await fetch_json(client, f"{OPENF1_BASE}/car_data", params)
-        if data and len(data) > 0:
-            return data[:500]
+        data = None
+        if lap:
+            dl = await fetch_json(client, f"{OPENF1_BASE}/laps",
+                                  {"session_key": session_key, "driver_number": driver_number})
+            dl = [x for x in (dl or []) if x.get("date_start")]
+            dl.sort(key=lambda x: x.get("lap_number", 0))
+            cur = next((x for x in dl if x.get("lap_number") == lap), None)
+            if cur is None and dl:
+                cur = dl[min(lap, len(dl)) - 1]
+            if cur:
+                start = _parse_dt(cur["date_start"])
+                end = start + datetime.timedelta(seconds=(cur.get("lap_duration") or 120))
+                url = (f"{OPENF1_BASE}/car_data?session_key={session_key}"
+                       f"&driver_number={driver_number}"
+                       f"&date%3E={start.strftime('%Y-%m-%dT%H:%M:%S')}"
+                       f"&date%3C={end.strftime('%Y-%m-%dT%H:%M:%S')}")
+                data = await fetch_json(client, url)
+        if not data:
+            data = await fetch_json(client, f"{OPENF1_BASE}/car_data",
+                                    {"session_key": session_key, "driver_number": driver_number})
+    if data:
+        moving = [p for p in data if (p.get("speed") or 0) > 0]  # drop garage idle
+        out = moving if len(moving) > 20 else data
+        return out[:600]
     points = []
     for i in range(200):
         t = i / 200.0
