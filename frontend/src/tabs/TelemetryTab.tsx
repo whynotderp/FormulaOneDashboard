@@ -169,16 +169,24 @@ function TrackMap({
 
   const d = smoothPath(outline, true);
 
-  // Split the real outline into the three timing sectors as a subtle overlay.
+  // Sector-start markers: a perpendicular tick + label where each sector begins
+  // (boundaries approximated by splitting the lap into thirds by distance).
   const sectorColors = ['#fb923c', '#38bdf8', '#a78bfa'];
   const sectorLabels = ['S1', 'S2', 'S3'];
   const n = outline.length;
   const sectors = (showSectors && n > 6) ? [0, 1, 2].map(k => {
-    const a = Math.floor((n * k) / 3);
-    const b = Math.floor((n * (k + 1)) / 3);
-    const seg = outline.slice(a, k === 2 ? n : b + 1);
-    const mid = seg[Math.floor(seg.length / 2)] || seg[0];
-    return { d: smoothPath(seg, false), color: sectorColors[k], label: sectorLabels[k], mid };
+    const idx = Math.floor((n * k) / 3);
+    const p = outline[idx];
+    const q = outline[(idx + 1) % n];
+    const dx = q.x - p.x, dy = q.y - p.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len; // perpendicular to track direction
+    const L = 26;
+    return {
+      x1: p.x - nx * L, y1: p.y - ny * L, x2: p.x + nx * L, y2: p.y + ny * L,
+      lx: p.x + nx * (L + 14), ly: p.y + ny * (L + 14),
+      color: sectorColors[k], label: sectorLabels[k],
+    };
   }) : [];
 
   // Who is in the pit lane right now (replay): pit events near current lap time,
@@ -228,17 +236,15 @@ function TrackMap({
           {/* track bed: dark outer kerb + clean grey surface */}
           <path d={d} ref={pathRef} fill="none" stroke="#000" strokeWidth={40} strokeLinecap="round" strokeLinejoin="round" />
           <path d={d} fill="none" stroke="#4b4b4b" strokeWidth={30} strokeLinecap="round" strokeLinejoin="round" />
-          {/* optional thin sector accent on top of the surface */}
-          {sectors.map(s => s.d && (
-            <path key={s.label} d={s.d} fill="none" stroke={s.color} strokeWidth={8}
-              strokeOpacity={0.9} strokeLinecap="round" strokeLinejoin="round" />
-          ))}
           {/* start/finish marker */}
           <path d={d} fill="none" stroke="#e10600" strokeWidth={6} strokeLinecap="round" strokeDasharray="6 400" />
-          {/* sector labels */}
-          {sectors.map(s => s.mid && (
-            <text key={s.label + '-l'} x={s.mid.x} y={s.mid.y - 16} textAnchor="middle"
-              fontSize={15} fontWeight="bold" fill={s.color}>{s.label}</text>
+          {/* sector-start indicators */}
+          {sectors.map(s => (
+            <g key={s.label}>
+              <line x1={s.x1} y1={s.y1} x2={s.x2} y2={s.y2} stroke={s.color} strokeWidth={4} strokeLinecap="round" />
+              <text x={s.lx} y={s.ly} textAnchor="middle" dominantBaseline="middle"
+                fontSize={15} fontWeight="bold" fill={s.color}>{s.label}</text>
+            </g>
           ))}
         </>}
 

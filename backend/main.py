@@ -515,6 +515,7 @@ async def get_track_outline(session_key: Optional[int] = None,
                    for p in data if p.get("x") is not None and (p.get("x") or p.get("y"))]
             # drop the (0,0) garbage samples OpenF1 emits between laps
             pts = [p for p in pts if not (p["x"] == 0 and p["y"] == 0)]
+            pts = _clean_trace(pts)
             if len(pts) > 40:
                 step = max(1, len(pts) // 600)
                 pts = pts[::step][:600]
@@ -535,6 +536,24 @@ async def get_track_outline(session_key: Optional[int] = None,
 # ---------------------------------------------------------------------------
 # Lap-by-lap replay (real car positions from /location)
 # ---------------------------------------------------------------------------
+
+def _clean_trace(pts: List[Dict]) -> List[Dict]:
+    """Drop outlier samples (GPS spikes, pit/in-lap detours) that would draw
+    stray spurs off the track: any point that jumps more than ~4x the median
+    step from the previous kept point."""
+    if len(pts) < 5:
+        return pts
+    steps = [math.dist((pts[i - 1]["x"], pts[i - 1]["y"]), (pts[i]["x"], pts[i]["y"]))
+             for i in range(1, len(pts))]
+    ss = sorted(steps)
+    med = ss[len(ss) // 2] or 1.0
+    thr = med * 4.0
+    out = [pts[0]]
+    for p in pts[1:]:
+        if math.dist((out[-1]["x"], out[-1]["y"]), (p["x"], p["y"])) <= thr:
+            out.append(p)
+    return out
+
 
 def _fit_transform(points: List[Dict], pad: float = 50.0, span: float = 1000.0):
     """Build a transform that fits `points` into a square viewBox; reusable so
@@ -659,7 +678,7 @@ async def get_replay(session_key: int, lap: int = 1):
         by_drv[dn].sort(key=lambda q: q["t"])
 
     # outline + shared transform from the reference driver's lap (the racing line)
-    ref_pts = by_drv.get(ref) or max(by_drv.values(), key=len)
+    ref_pts = _clean_trace(by_drv.get(ref) or max(by_drv.values(), key=len))
     tf = _fit_transform(ref_pts)
 
     def _downsample(seq, n=120):
