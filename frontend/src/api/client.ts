@@ -154,6 +154,26 @@ export const getTrackOutline = (sessionKey?: number, circuitId = 'bahrain', driv
   api.get<TrackOutline>('/api/track_outline', {
     params: { session_key: sessionKey, circuit_id: circuitId, driver_number: driverNumber },
   });
+
+export interface ReplayCar {
+  driver_number: number;
+  code: string;
+  team: string;
+  samples: { x: number; y: number; t: number }[];
+}
+export interface Replay {
+  source: 'telemetry' | 'none';
+  lap: number;
+  total_laps: number;
+  viewBox: string;
+  outline: { x: number; y: number }[];
+  cars: ReplayCar[];
+}
+export const getReplayMeta = (sessionKey: number) =>
+  api.get<{ session_key: number; total_laps: number; has_replay: boolean }>(
+    '/api/replay_meta', { params: { session_key: sessionKey } });
+export const getReplay = (sessionKey: number, lap: number) =>
+  api.get<Replay>('/api/replay', { params: { session_key: sessionKey, lap } });
 export const getDrivers = (sessionKey?: number) => api.get<Driver[]>('/api/drivers', { params: { session_key: sessionKey } });
 export const getLaps = (sessionKey: number, driverNumber?: number) =>
   api.get<Lap[]>('/api/laps', { params: { session_key: sessionKey, driver_number: driverNumber } });

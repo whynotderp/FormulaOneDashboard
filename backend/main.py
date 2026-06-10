@@ -530,6 +530,139 @@ async def get_track_outline(session_key: Optional[int] = None,
 
 
 # ---------------------------------------------------------------------------
+# Lap-by-lap replay (real car positions from /location)
+# ---------------------------------------------------------------------------
+
+def _fit_transform(points: List[Dict], pad: float = 50.0, span: float = 1000.0):
+    """Build a transform that fits `points` into a square viewBox; reusable so
+    the outline and every car use the same coordinate mapping."""
+    xs = [p["x"] for p in points]
+    ys = [p["y"] for p in points]
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    w = max(maxx - minx, 1.0)
+    h = max(maxy - miny, 1.0)
+    scale = (span - 2 * pad) / max(w, h)
+    ox = pad + (span - 2 * pad - w * scale) / 2
+    oy = pad + (span - 2 * pad - h * scale) / 2
+
+    def tf(x: float, y: float):
+        return (round(ox + (x - minx) * scale, 1), round(span - (oy + (y - miny) * scale), 1))
+    return tf
+
+
+def _parse_dt(s: str) -> Optional[datetime.datetime]:
+    try:
+        return datetime.datetime.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _reference_laps(client: httpx.AsyncClient, session_key: int):
+    """Return (reference_driver_number, ordered lap list) where the reference is
+    the driver who completed the most laps (the leader/finisher)."""
+    laps = await fetch_json(client, f"{OPENF1_BASE}/laps", {"session_key": session_key})
+    if not laps:
+        return None, []
+    by_drv: Dict[int, List[Dict]] = {}
+    for l in laps:
+        dn = l.get("driver_number")
+        if dn is not None and l.get("date_start"):
+            by_drv.setdefault(dn, []).append(l)
+    if not by_drv:
+        return None, []
+    for dn in by_drv:
+        by_drv[dn].sort(key=lambda x: x.get("lap_number", 0))
+    ref = max(by_drv, key=lambda dn: len(by_drv[dn]))
+    return ref, by_drv[ref]
+
+
+@app.get("/api/replay_meta")
+async def get_replay_meta(session_key: int):
+    """Lightweight: how many laps can be replayed for this session."""
+    async with httpx.AsyncClient() as client:
+        ref, ref_laps = await _reference_laps(client, session_key)
+    return {"session_key": session_key, "total_laps": len(ref_laps),
+            "has_replay": len(ref_laps) > 0}
+
+
+@app.get("/api/replay")
+async def get_replay(session_key: int, lap: int = 1):
+    """Real car positions for one lap of a session. Uses the reference driver's
+    lap window to bound time, fetches every car's /location in that window, and
+    returns the outline (the reference racing line) plus per-car position samples
+    with a normalized time t in 0..1. All share one coordinate transform."""
+    async with httpx.AsyncClient() as client:
+        ref, ref_laps = await _reference_laps(client, session_key)
+        if not ref_laps:
+            return {"source": "none", "lap": 0, "total_laps": 0,
+                    "viewBox": "0 0 1000 1000", "outline": [], "cars": []}
+        total = len(ref_laps)
+        lap = max(1, min(total, lap))
+        idx = {l["lap_number"]: i for i, l in enumerate(ref_laps)}
+        i = idx.get(lap, lap - 1)
+        cur = ref_laps[i]
+        start = _parse_dt(cur.get("date_start"))
+        if start is None:
+            return {"source": "none", "lap": lap, "total_laps": total,
+                    "viewBox": "0 0 1000 1000", "outline": [], "cars": []}
+        if i + 1 < len(ref_laps) and ref_laps[i + 1].get("date_start"):
+            end = _parse_dt(ref_laps[i + 1]["date_start"])
+        else:
+            end = start + datetime.timedelta(seconds=(cur.get("lap_duration") or 110))
+        # OpenF1 date filters: drop tz/fraction (a '+' in a query breaks it)
+        s_iso = start.strftime("%Y-%m-%dT%H:%M:%S")
+        e_iso = end.strftime("%Y-%m-%dT%H:%M:%S")
+        url = (f"{OPENF1_BASE}/location?session_key={session_key}"
+               f"&date%3E={s_iso}&date%3C={e_iso}")
+        loc = await fetch_json(client, url)
+        drv = await fetch_json(client, f"{OPENF1_BASE}/drivers", {"session_key": session_key})
+
+    if not loc:
+        return {"source": "none", "lap": lap, "total_laps": total,
+                "viewBox": "0 0 1000 1000", "outline": [], "cars": []}
+
+    info = {d["number"]: d for d in (normalize_drivers(drv) if drv else [])}
+    span_s = max((end - start).total_seconds(), 1.0)
+
+    by_drv: Dict[int, List[Dict]] = {}
+    for p in loc:
+        dn = p.get("driver_number")
+        if dn is None or p.get("x") is None:
+            continue
+        if p["x"] == 0 and p["y"] == 0:
+            continue
+        dt = _parse_dt(p.get("date"))
+        if dt is None:
+            continue
+        by_drv.setdefault(dn, []).append(
+            {"x": p["x"], "y": p["y"], "t": (dt - start).total_seconds() / span_s})
+    for dn in by_drv:
+        by_drv[dn].sort(key=lambda q: q["t"])
+
+    # outline + shared transform from the reference driver's lap (the racing line)
+    ref_pts = by_drv.get(ref) or max(by_drv.values(), key=len)
+    tf = _fit_transform(ref_pts)
+
+    def _downsample(seq, n=120):
+        if len(seq) <= n:
+            return seq
+        step = len(seq) / n
+        return [seq[int(k * step)] for k in range(n)]
+
+    outline = [{"x": tf(p["x"], p["y"])[0], "y": tf(p["x"], p["y"])[1]} for p in _downsample(ref_pts, 200)]
+    cars = []
+    for dn, seq in by_drv.items():
+        ds = _downsample(seq, 120)
+        samples = [{"x": tf(p["x"], p["y"])[0], "y": tf(p["x"], p["y"])[1],
+                    "t": round(p["t"], 4)} for p in ds]
+        meta = info.get(dn, {})
+        cars.append({"driver_number": dn, "code": meta.get("code", str(dn)),
+                     "team": meta.get("team", "Unknown"), "samples": samples})
+    return {"source": "telemetry", "lap": lap, "total_laps": total,
+            "viewBox": "0 0 1000 1000", "outline": outline, "cars": cars}
+
+
+# ---------------------------------------------------------------------------
 # Race Predictor
 # ---------------------------------------------------------------------------
 

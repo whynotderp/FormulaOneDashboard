@@ -6,8 +6,9 @@ import {
 import {
   getSessions, getDrivers, getLaps, getCarData, getStints,
   getWeather, getRaceControl, getPositions, getTrackOutline,
+  getReplayMeta, getReplay,
 } from '../api/client';
-import type { Session, Driver, Lap, CarData, Stint, Weather, RaceControl, Position, TrackOutline } from '../api/client';
+import type { Session, Driver, Lap, CarData, Stint, Weather, RaceControl, Position, TrackOutline, ReplayCar } from '../api/client';
 import { LoadingSpinner, ErrorMessage } from '../components/LoadingSpinner';
 import { TeamBadge, getTeamColor } from '../components/TeamBadge';
 
@@ -109,21 +110,42 @@ function CompoundBadge({ compound }: { compound: string }) {
   return <span className={`px-2 py-0.5 rounded text-xs font-bold ${cls[compound] || 'bg-gray-700 text-white'}`}>{compound[0]}</span>;
 }
 
+// Linear-interpolate a car's position at normalized lap time p (0..1).
+function interpAt(samples: { x: number; y: number; t: number }[], p: number) {
+  if (samples.length === 0) return null;
+  if (p <= samples[0].t) return samples[0];
+  const last = samples[samples.length - 1];
+  if (p >= last.t) return last;
+  for (let i = 0; i < samples.length - 1; i++) {
+    const a = samples[i], b = samples[i + 1];
+    if (p >= a.t && p <= b.t) {
+      const f = (p - a.t) / Math.max(b.t - a.t, 1e-6);
+      return { x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f };
+    }
+  }
+  return last;
+}
+
 function TrackMap({
-  outline, positions, drivers, selectedDrivers, sourceLabel, playing, speed,
+  outline, replayCars, positions, drivers, selectedDrivers, sourceLabel,
+  playing, speed, onLapComplete,
 }: {
-  outline: { x: number; y: number }[]; positions: Position[]; drivers: Driver[];
-  selectedDrivers: number[]; sourceLabel: string; playing: boolean; speed: number;
+  outline: { x: number; y: number }[]; replayCars?: ReplayCar[];
+  positions: Position[]; drivers: Driver[]; selectedDrivers: number[];
+  sourceLabel: string; playing: boolean; speed: number; onLapComplete?: () => void;
 }) {
   const pathRef = useRef<SVGPathElement>(null);
   const progress = useRef(0);
   const [, force] = useState(0);
+  const replay = !!(replayCars && replayCars.length > 0);
 
   const d = outline.length
     ? 'M' + outline.map(p => `${p.x},${p.y}`).join(' L ') + ' Z'
     : '';
 
-  // rAF loop advances a shared lap progress; each car is offset by running order
+  // reset playback to the start of a lap whenever new replay data arrives
+  useEffect(() => { progress.current = 0; }, [replayCars]);
+
   useEffect(() => {
     if (!playing || !d) return;
     let raf = 0;
@@ -131,39 +153,56 @@ function TrackMap({
     const loop = (now: number) => {
       const dt = (now - last) / 1000;
       last = now;
-      progress.current = (progress.current + dt * 0.04 * speed) % 1;
+      const rate = (replay ? 0.085 : 0.04) * speed; // replay ~12s/lap at 1x
+      let np = progress.current + dt * rate;
+      if (np >= 1) {
+        if (replay && onLapComplete) { progress.current = 0; onLapComplete(); }
+        else { np %= 1; progress.current = np; }
+      } else progress.current = np;
       force(v => (v + 1) % 1_000_000);
       raf = requestAnimationFrame(loop);
     };
     raf = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(raf);
-  }, [playing, speed, d]);
+  }, [playing, speed, d, replay, onLapComplete]);
 
   const path = pathRef.current;
   const total = path ? path.getTotalLength() : 0;
 
-  // running order → evenly spaced cars that all orbit together.
-  // Fall back to the driver list if position data is missing (some live feeds
-  // omit it), so cars always appear on track.
+  // orbit fallback ordering (no telemetry): string the field out by running order
   const ordered: { driver_number: number; position: number }[] =
     positions.length > 0
       ? [...positions].sort((a, b) => (a.position || 99) - (b.position || 99))
       : drivers.slice(0, 20).map((d, i) => ({ driver_number: d.number, position: i + 1 }));
-  // small leader-to-tail spread so the field is strung out but distinct,
-  // not bunched into one corner
   const spread = 0.55;
 
   return (
     <div className="relative">
-      <svg viewBox="0 0 1000 1000" className="w-full" style={{ height: '320px' }}>
+      <svg viewBox="0 0 1000 1000" className="w-full" style={{ height: '340px' }}>
         {d && <>
-          {/* track bed */}
           <path d={d} ref={pathRef} fill="none" stroke="#2a2a2a" strokeWidth={42} strokeLinecap="round" strokeLinejoin="round" />
           <path d={d} fill="none" stroke="#3a3a3a" strokeWidth={30} strokeLinecap="round" strokeLinejoin="round" />
-          {/* start/finish marker */}
           <path d={d} fill="none" stroke="#e10600" strokeWidth={6} strokeLinecap="round" strokeDasharray="8 600" />
         </>}
-        {total > 0 && ordered.map((pos, idx) => {
+
+        {/* REPLAY: real car positions interpolated from telemetry */}
+        {replay && replayCars!.map(car => {
+          const pt = interpAt(car.samples, progress.current);
+          if (!pt) return null;
+          const color = getTeamColor(car.team);
+          const isSel = selectedDrivers.includes(car.driver_number);
+          return (
+            <g key={car.driver_number} opacity={isSel ? 1 : 0.7}>
+              <circle cx={pt.x} cy={pt.y} r={isSel ? 17 : 12} fill={color}
+                stroke={isSel ? '#fff' : '#0f0f0f'} strokeWidth={isSel ? 3 : 1.5} />
+              <text x={pt.x} y={pt.y - 22} textAnchor="middle" fontSize={isSel ? 24 : 18}
+                fill={color} fontWeight="bold">{car.code}</text>
+            </g>
+          );
+        })}
+
+        {/* ORBIT fallback: no telemetry (e.g. future race) */}
+        {!replay && total > 0 && ordered.map((pos, idx) => {
           const driver = drivers.find(dr => dr.number === pos.driver_number);
           const offset = ordered.length > 1 ? (idx / ordered.length) * spread : 0;
           const frac = (progress.current - offset + 1) % 1;
@@ -180,9 +219,7 @@ function TrackMap({
           );
         })}
       </svg>
-      <div className="absolute top-2 left-2 text-[10px] text-[#6b7280]">
-        {sourceLabel}
-      </div>
+      <div className="absolute top-2 left-2 text-[10px] text-[#6b7280]">{sourceLabel}</div>
     </div>
   );
 }
@@ -203,6 +240,10 @@ export function TelemetryTab() {
   const [trackSource, setTrackSource] = useState<TrackOutline['source']>('generated');
   const [playing, setPlaying] = useState(true);
   const [speed, setSpeed] = useState(1);
+  // lap replay
+  const [totalLaps, setTotalLaps] = useState(0);
+  const [currentLap, setCurrentLap] = useState(1);
+  const [replayCars, setReplayCars] = useState<ReplayCar[] | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -261,8 +302,10 @@ export function TelemetryTab() {
       .catch(() => setStints(MOCK_STINTS));
   }, [selectedSession, selectedDrivers]);
 
-  // Build the track outline from real telemetry when possible; else generate one.
+  // Static outline (real circuit geometry or generated) — only when there's no
+  // lap replay available; replay provides its own per-lap racing-line outline.
   useEffect(() => {
+    if (totalLaps > 0) return;
     getTrackOutline(selectedSession || undefined, circuitId, selectedDrivers[0])
       .then(r => {
         if (r.data.points?.length > 10) {
@@ -274,7 +317,33 @@ export function TelemetryTab() {
         }
       })
       .catch(() => { setOutline(mockOutline(circuitId)); setTrackSource('generated'); });
-  }, [selectedSession, circuitId]);
+  }, [selectedSession, circuitId, totalLaps]);
+
+  // Is a lap-by-lap replay available for this session?
+  useEffect(() => {
+    if (!selectedSession) return;
+    setReplayCars(undefined); setTotalLaps(0); setCurrentLap(1);
+    getReplayMeta(selectedSession)
+      .then(r => { if (r.data.has_replay) setTotalLaps(r.data.total_laps); })
+      .catch(() => {});
+  }, [selectedSession]);
+
+  // Fetch the selected lap's real car positions.
+  useEffect(() => {
+    if (!selectedSession || totalLaps <= 0) return;
+    getReplay(selectedSession, currentLap)
+      .then(r => {
+        if (r.data.cars?.length) {
+          setReplayCars(r.data.cars);
+          if (r.data.outline?.length) { setOutline(r.data.outline); setTrackSource('telemetry'); }
+        }
+      })
+      .catch(() => {});
+  }, [selectedSession, totalLaps, currentLap]);
+
+  const handleLapComplete = useCallback(() => {
+    setCurrentLap(l => (l >= totalLaps ? 1 : l + 1));
+  }, [totalLaps]);
 
   const toggleDriver = useCallback((num: number) => {
     setSelectedDrivers(prev => prev.includes(num) ? prev.filter(d => d !== num) : prev.length < 5 ? [...prev, num] : prev);
@@ -350,7 +419,9 @@ export function TelemetryTab() {
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">
         <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
           <div className="flex items-center justify-between mb-3">
-            <h3 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider">Circuit Map</h3>
+            <h3 className="text-xs font-semibold text-[#6b7280] uppercase tracking-wider">
+              Circuit Map {totalLaps > 0 && <span className="text-[#e5e5e5] normal-case">· Lap {currentLap}/{totalLaps}</span>}
+            </h3>
             <div className="flex items-center gap-2">
               <button onClick={() => setPlaying(p => !p)}
                 className="text-xs px-2 py-0.5 rounded bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] hover:border-[#e10600]">
@@ -362,11 +433,28 @@ export function TelemetryTab() {
               </select>
             </div>
           </div>
-          <TrackMap outline={outline} positions={positions} drivers={drivers}
+
+          {/* Lap scrubber — replay control for previous sessions */}
+          {totalLaps > 0 && (
+            <div className="flex items-center gap-2 mb-3">
+              <button onClick={() => setCurrentLap(l => Math.max(1, l - 1))}
+                className="text-xs px-2 py-0.5 rounded bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] hover:border-[#e10600]">◀</button>
+              <input type="range" min={1} max={totalLaps} value={currentLap}
+                onChange={e => setCurrentLap(Number(e.target.value))}
+                className="flex-1 accent-[#e10600]" />
+              <button onClick={() => setCurrentLap(l => Math.min(totalLaps, l + 1))}
+                className="text-xs px-2 py-0.5 rounded bg-[#0f0f0f] border border-[#2a2a2a] text-[#e5e5e5] hover:border-[#e10600]">▶</button>
+              <span className="text-xs text-[#6b7280] w-16 text-right tabular-nums">Lap {currentLap}/{totalLaps}</span>
+            </div>
+          )}
+
+          <TrackMap outline={outline} replayCars={replayCars} positions={positions} drivers={drivers}
             selectedDrivers={selectedDrivers} playing={playing} speed={speed}
+            onLapComplete={handleLapComplete}
             sourceLabel={
-              trackSource === 'telemetry' ? 'Live telemetry trace'
+              replayCars && replayCars.length > 0 ? `Replay · real positions · lap ${currentLap}`
               : trackSource === 'circuit' ? `${circuitId} · real circuit`
+              : trackSource === 'telemetry' ? 'Live telemetry trace'
               : `${circuitId} · simulated shape`
             } />
         </div>
