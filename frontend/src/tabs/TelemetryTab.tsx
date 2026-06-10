@@ -151,19 +151,20 @@ function TrackMap({
     ? 'M' + outline.map(p => `${p.x},${p.y}`).join(' L ') + ' Z'
     : '';
 
-  // Pit lane: offset a slice of the track near the start/finish line inward
-  // toward the track centroid (representational — real pit-lane geometry isn't
-  // in the open data).
-  const cx0 = outline.length ? outline.reduce((s, p) => s + p.x, 0) / outline.length : 500;
-  const cy0 = outline.length ? outline.reduce((s, p) => s + p.y, 0) / outline.length : 500;
-  const pitSlice = outline.slice(0, Math.max(2, Math.floor(outline.length * 0.16)));
-  const pitLane = pitSlice.map(p => {
-    const dx = cx0 - p.x, dy = cy0 - p.y;
-    const len = Math.hypot(dx, dy) || 1;
-    const off = 60;
-    return { x: p.x + (dx / len) * off, y: p.y + (dy / len) * off };
-  });
-  const pitD = pitLane.length > 1 ? 'M' + pitLane.map(p => `${p.x},${p.y}`).join(' L ') : '';
+  // Split the real outline into the three timing sectors as a colored overlay.
+  const sectorColors = ['#fb923c', '#38bdf8', '#a78bfa'];
+  const sectorLabels = ['S1', 'S2', 'S3'];
+  const n = outline.length;
+  const sectors = n > 6 ? [0, 1, 2].map(k => {
+    const a = Math.floor((n * k) / 3);
+    const b = Math.floor((n * (k + 1)) / 3);
+    const seg = outline.slice(a, k === 2 ? n : b + 1);
+    const mid = seg[Math.floor(seg.length / 2)] || seg[0];
+    return {
+      d: seg.length > 1 ? 'M' + seg.map(p => `${p.x},${p.y}`).join(' L ') : '',
+      color: sectorColors[k], label: sectorLabels[k], mid,
+    };
+  }) : [];
 
   // Who is in the pit lane right now (replay): pit events near current lap time,
   // de-duplicated by driver (OpenF1 can emit multiple rows per stop).
@@ -209,16 +210,22 @@ function TrackMap({
     <div className="relative">
       <svg viewBox="0 0 1000 1000" className="w-full" style={{ height: '340px' }}>
         {d && <>
+          {/* track bed */}
           <path d={d} ref={pathRef} fill="none" stroke="#2a2a2a" strokeWidth={42} strokeLinecap="round" strokeLinejoin="round" />
-          <path d={d} fill="none" stroke="#3a3a3a" strokeWidth={30} strokeLinecap="round" strokeLinejoin="round" />
+          {/* sector overlay (S1/S2/S3) on the real outline */}
+          {sectors.length === 3
+            ? sectors.map(s => s.d && (
+                <path key={s.label} d={s.d} fill="none" stroke={s.color} strokeWidth={28}
+                  strokeOpacity={0.5} strokeLinecap="round" strokeLinejoin="round" />
+              ))
+            : <path d={d} fill="none" stroke="#3a3a3a" strokeWidth={30} strokeLinecap="round" strokeLinejoin="round" />}
+          {/* start/finish marker */}
           <path d={d} fill="none" stroke="#e10600" strokeWidth={6} strokeLinecap="round" strokeDasharray="8 600" />
-          {/* pit lane */}
-          {pitD && <>
-            <path d={pitD} fill="none" stroke="#1f1f1f" strokeWidth={16} strokeLinecap="round" strokeLinejoin="round" />
-            <path d={pitD} fill="none" stroke="#facc15" strokeWidth={4} strokeLinecap="round" strokeLinejoin="round" strokeDasharray="10 8" />
-            <text x={pitLane[Math.floor(pitLane.length / 2)].x} y={pitLane[Math.floor(pitLane.length / 2)].y - 14}
-              textAnchor="middle" fontSize={16} fill="#facc15" fontWeight="bold">PIT</text>
-          </>}
+          {/* sector labels */}
+          {sectors.map(s => s.mid && (
+            <text key={s.label + '-l'} x={s.mid.x} y={s.mid.y} textAnchor="middle"
+              fontSize={15} fontWeight="bold" fill={s.color} stroke="#0f0f0f" strokeWidth={0.5}>{s.label}</text>
+          ))}
         </>}
 
         {/* REPLAY: real car positions interpolated from telemetry */}
