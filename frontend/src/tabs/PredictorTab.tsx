@@ -230,7 +230,7 @@ export function PredictorTab() {
               {[
                 { factor: 'Grid / Qualifying Position', weight: '45%', color: '#e10600' },
                 { factor: 'Team Pace', weight: '25%', color: '#f59e0b' },
-                { factor: 'Recent Form (last 5 races)', weight: '20%', color: '#22c55e' },
+                { factor: 'Recent Form (this season weighted 3x)', weight: '20%', color: '#22c55e' },
                 { factor: 'Circuit Performance', weight: '10%', color: '#3b82f6' },
               ].map(f => (
                 <div key={f.factor} className="flex flex-col gap-1">

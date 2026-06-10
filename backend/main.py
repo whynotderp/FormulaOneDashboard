@@ -871,18 +871,28 @@ async def predict_race(circuit_id: str = "bahrain", weather: str = "dry",
             grid = await _real_grid(client, session_key, meeting_key)
             if grid:
                 grid_source = "qualifying"
-        # recent form: finishing positions over the last 5 races of the prior season
-        form: Dict[str, List[int]] = {}
-        ergast = await fetch_json(client, f"{ERGAST_BASE}/{CURRENT_YEAR - 1}/results.json", {"limit": 500})
-        if ergast:
+        # Recent form: finishing positions weighted so THIS season counts far
+        # more than last season (and more-recent races within a season count a
+        # bit more). form[code] = list of (position, weight).
+        form: Dict[str, List] = {}
+
+        async def _add_season(year: int, base_weight: float):
+            erg = await fetch_json(client, f"{ERGAST_BASE}/{year}/results.json", {"limit": 500})
+            if not erg:
+                return
             try:
-                for race in ergast["MRData"]["RaceTable"]["Races"][-5:]:
+                races = erg["MRData"]["RaceTable"]["Races"][-5:]
+                for ri, race in enumerate(races):
+                    w = base_weight * (1.0 + 0.15 * ri)  # later races in the run weigh more
                     for res in race.get("Results", []):
                         code = res.get("Driver", {}).get("code", "")
                         if code:
-                            form.setdefault(code, []).append(int(res.get("position", 10)))
+                            form.setdefault(code, []).append((int(res.get("position", 10)), w))
             except Exception:
                 pass
+
+        await _add_season(CURRENT_YEAR, 3.0)       # this season dominates
+        await _add_season(CURRENT_YEAR - 1, 1.0)   # last season is a lighter prior
 
     if circuit_id not in CIRCUIT_INCIDENTS:
         circuit_id = "bahrain"
@@ -899,8 +909,12 @@ async def predict_race(circuit_id: str = "bahrain", weather: str = "dry",
     for d in drivers:
         q = grid.get(d["number"], n)
         pace = TEAM_PACE.get(d["team"], 1.045)
-        form_list = form.get(d["code"], [])
-        form_avg = sum(form_list) / len(form_list) if form_list else q
+        form_list = form.get(d["code"], [])  # [(position, weight), ...]
+        if form_list:
+            tw = sum(w for _, w in form_list)
+            form_avg = sum(p * w for p, w in form_list) / tw
+        else:
+            form_avg = q
         circuit_factor = (_stable_unit(d["code"] + circuit_id) - 0.5) * 2.0  # -1..1
         score = (0.45 * q
                  + 0.25 * ((pace - 1.0) * 250)
