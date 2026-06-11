@@ -784,8 +784,15 @@ export function TelemetryTab() {
                       <span>{d?.name || `#${pos.driver_number}`}</span>
                     </div></td>
                     <td className="py-2"><TeamBadge team={d?.team || ''} /></td>
-                    <td className="py-2 text-right font-mono text-[#6b7280]">{pos.gap_to_leader > 0 ? `+${pos.gap_to_leader.toFixed(3)}s` : 'LEADER'}</td>
-                    <td className="py-2 text-right font-mono text-[#6b7280]">{pos.interval > 0 ? `+${pos.interval.toFixed(3)}s` : '—'}</td>
+                    <td className="py-2 text-right font-mono text-[#6b7280]">
+                      {pos.position === 1 ? 'LEADER'
+                        : (pos.laps_down ?? 0) > 0 ? `+${pos.laps_down} LAP${pos.laps_down! > 1 ? 'S' : ''}`
+                        : pos.gap_to_leader > 0 ? `+${pos.gap_to_leader.toFixed(3)}s` : '—'}
+                    </td>
+                    <td className="py-2 text-right font-mono text-[#6b7280]">
+                      {(pos.interval_laps ?? 0) > 0 ? `+${pos.interval_laps} LAP${pos.interval_laps! > 1 ? 'S' : ''}`
+                        : pos.interval > 0 ? `+${pos.interval.toFixed(3)}s` : '—'}
+                    </td>
                   </tr>
                 );
               })}

@@ -50,11 +50,14 @@ function buildFallbackTeam(cid: string): FantasyTeam {
     if (tc >= 2 || d.price > budget - 9) continue;
     picked.push(d); usedTeams[d.team] = tc + 1; budget -= d.price;
   }
-  const con = [...FALLBACK_CONSTRUCTORS].sort((a, b) => b.pts_per_million - a.pts_per_million).find(c => c.price <= budget) || FALLBACK_CONSTRUCTORS[0];
+  const cons = [...FALLBACK_CONSTRUCTORS].sort((a, b) => b.predicted_points - a.predicted_points);
+  const pickedCons: FantasyConstructor[] = [];
+  for (const c of cons) { if (pickedCons.length >= 2) break; if (c.price <= budget - (pickedCons.length === 0 ? 6 : 0)) { pickedCons.push(c); budget -= c.price; } }
   const cap = picked.reduce((a, b) => a.predicted_points > b.predicted_points ? a : b, picked[0]);
-  const totalCost = picked.reduce((s, d) => s + d.price, 0) + con.price;
-  const totalPts = picked.reduce((s, d) => s + (d.code === cap?.code ? d.predicted_points * 2 : d.predicted_points), 0) + con.predicted_points;
-  return { circuit: cid, budget: 100, total_cost: Math.round(totalCost*10)/10, budget_remaining: Math.round((100-totalCost)*10)/10, drivers: picked, constructor: con, captain: cap, total_predicted_points: Math.round(totalPts*10)/10, reasoning: `Top value picks by pts/$M. Captain ${cap?.name} earns 2× points.` };
+  const conCost = pickedCons.reduce((s, c) => s + c.price, 0);
+  const totalCost = picked.reduce((s, d) => s + d.price, 0) + conCost;
+  const totalPts = picked.reduce((s, d) => s + (d.code === cap?.code ? d.predicted_points * 2 : d.predicted_points), 0) + pickedCons.reduce((s, c) => s + c.predicted_points, 0);
+  return { circuit: cid, budget: 100, total_cost: Math.round(totalCost*10)/10, budget_remaining: Math.round((100-totalCost)*10)/10, drivers: picked, constructors: pickedCons, captain: cap, total_predicted_points: Math.round(totalPts*10)/10, reasoning: `5 drivers + 2 constructors by value. Captain ${cap?.name} earns 2× points.` };
 }
 
 export function FantasyTab() {
@@ -159,10 +162,13 @@ export function FantasyTab() {
                 <div className="text-xs text-yellow-400 mt-0.5">{team.captain?.predicted_points} × 2 = {(team.captain?.predicted_points||0)*2} pts</div>
               </div>
               <div>
-                <div className="text-xs text-[#6b7280] mb-1">Constructor</div>
-                <div className="text-sm font-bold">{team.constructor?.name}</div>
-                <div className="text-xs text-green-400">{team.constructor?.predicted_points} pred. pts</div>
-                <div className="text-xs text-[#6b7280]">${team.constructor?.price}M</div>
+                <div className="text-xs text-[#6b7280] mb-1">Constructors (2)</div>
+                {(team.constructors || []).map(c => (
+                  <div key={c.name} className="flex justify-between gap-2">
+                    <span className="text-sm font-bold">{c.name}</span>
+                    <span className="text-xs text-green-400">{c.predicted_points}pt</span>
+                  </div>
+                ))}
               </div>
             </div>
             <div className="mt-3 text-xs text-[#6b7280] border-t border-[#2a2a2a] pt-3">
@@ -276,7 +282,7 @@ export function FantasyTab() {
         <div className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-3">
             {allConstructors.map(c => (
-              <div key={c.name} className={`p-4 rounded-lg border ${team.constructor?.name === c.name ? 'border-[#e10600] bg-[#e10600]/10' : 'border-[#2a2a2a] bg-[#1a1a1a]'}`}>
+              <div key={c.name} className={`p-4 rounded-lg border ${(team.constructors || []).some(tc => tc.name === c.name) ? 'border-[#e10600] bg-[#e10600]/10' : 'border-[#2a2a2a] bg-[#1a1a1a]'}`}>
                 <div className="flex items-start justify-between mb-3">
                   <TeamBadge team={c.name} className="font-semibold" />
                   <div className="text-right"><div className="text-[#e10600] font-bold">${c.price}M</div></div>
@@ -291,7 +297,7 @@ export function FantasyTab() {
                     <div className="font-bold">{c.pts_per_million}</div>
                   </div>
                 </div>
-                {team.constructor?.name === c.name && <div className="mt-2 text-xs text-center text-[#e10600] font-semibold">SELECTED</div>}
+                {(team.constructors || []).some(tc => tc.name === c.name) && <div className="mt-2 text-xs text-center text-[#e10600] font-semibold">SELECTED</div>}
               </div>
             ))}
           </div>
@@ -304,7 +310,7 @@ export function FantasyTab() {
                 <YAxis tick={{ fontSize: 11, fill: '#6b7280' }} />
                 <Tooltip contentStyle={{ background: '#1a1a1a', border: '1px solid #2a2a2a', borderRadius: 6 }} />
                 <Bar dataKey="pts" name="Predicted Pts" radius={[4, 4, 0, 0]}>
-                  {allConstructors.map((c, i) => <Cell key={i} fill={team.constructor?.name === c.name ? '#e10600' : '#374151'} />)}
+                  {allConstructors.map((c, i) => <Cell key={i} fill={(team.constructors || []).some(tc => tc.name === c.name) ? '#e10600' : '#374151'} />)}
                 </Bar>
               </BarChart>
             </ResponsiveContainer>

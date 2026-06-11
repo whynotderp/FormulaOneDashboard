@@ -379,12 +379,22 @@ async def get_positions(session_key: int):
             dn = x.get("driver_number")
             if dn is not None:
                 latest_gap[dn] = x
-        result = [{
-            "driver_number": dn,
-            "position": position,
-            "gap_to_leader": _to_float(latest_gap.get(dn, {}).get("gap_to_leader")),
-            "interval": _to_float(latest_gap.get(dn, {}).get("interval")),
-        } for dn, position in latest_pos.items()]
+        def _gap(raw):
+            # OpenF1 gives a number of seconds, or a string like "+1 LAP(S)"
+            if isinstance(raw, str) and "LAP" in raw.upper():
+                digits = "".join(ch for ch in raw if ch.isdigit())
+                return 0.0, int(digits) if digits else 1
+            return _to_float(raw), 0
+        result = []
+        for dn, position in latest_pos.items():
+            g = latest_gap.get(dn, {})
+            gap_s, laps_down = _gap(g.get("gap_to_leader"))
+            itv_s, itv_laps = _gap(g.get("interval"))
+            result.append({
+                "driver_number": dn, "position": position,
+                "gap_to_leader": gap_s, "interval": itv_s,
+                "laps_down": laps_down, "interval_laps": itv_laps,
+            })
         result.sort(key=lambda r: r["position"])
         if result:
             return result
@@ -876,23 +886,28 @@ async def predict_race(circuit_id: str = "bahrain", weather: str = "dry",
         # bit more). form[code] = list of (position, weight).
         form: Dict[str, List] = {}
 
-        async def _add_season(year: int, base_weight: float):
+        async def _add_season(year: int, base_weight: float) -> int:
             erg = await fetch_json(client, f"{ERGAST_BASE}/{year}/results.json", {"limit": 500})
             if not erg:
-                return
+                return 0
             try:
-                races = erg["MRData"]["RaceTable"]["Races"][-5:]
+                races = erg["MRData"]["RaceTable"]["Races"][-6:]
                 for ri, race in enumerate(races):
-                    w = base_weight * (1.0 + 0.15 * ri)  # later races in the run weigh more
+                    w = base_weight * (1.0 + 0.2 * ri)  # later races in the run weigh more
                     for res in race.get("Results", []):
                         code = res.get("Driver", {}).get("code", "")
                         if code:
                             form.setdefault(code, []).append((int(res.get("position", 10)), w))
+                return len(races)
             except Exception:
-                pass
+                return 0
 
-        await _add_season(CURRENT_YEAR, 3.0)       # this season dominates
-        await _add_season(CURRENT_YEAR - 1, 1.0)   # last season is a lighter prior
+        # Current season is the primary signal (regulation eras make older form
+        # misleading). Once this season has a few races, ignore last season
+        # entirely; before that, lean on it only lightly.
+        cur_races = await _add_season(CURRENT_YEAR, 6.0)
+        if cur_races < 3:
+            await _add_season(CURRENT_YEAR - 1, 1.0)
 
     if circuit_id not in CIRCUIT_INCIDENTS:
         circuit_id = "bahrain"
@@ -1091,6 +1106,9 @@ async def get_optimal_fantasy_team(circuit_id: str = "bahrain", budget: float = 
     # reserve so the remaining driver slots + a constructor stay affordable, and
     # at most 2 drivers per team), rather than pure value — which would hoard
     # budget on cheap enablers.
+    # Official F1 Fantasy squad: 5 drivers + 2 constructors under the cap.
+    two_con_cost = sum(sorted(c["price"] for c in con_scores)[:2]) if len(con_scores) >= 2 \
+        else (min_con * 2)
     by_points = sorted(rows, key=lambda x: -x["predicted_points"])
     picked: List[Dict] = []
     remaining = budget
@@ -1101,7 +1119,7 @@ async def get_optimal_fantasy_team(circuit_id: str = "bahrain", budget: float = 
         if used_teams.get(d["team"], 0) >= 2:
             continue
         slots_after = 5 - len(picked) - 1
-        reserve = min_driver * slots_after + min_con
+        reserve = min_driver * slots_after + two_con_cost  # keep room for 2 constructors
         if d["price"] <= remaining - reserve:
             picked.append(d)
             remaining -= d["price"]
@@ -1113,30 +1131,40 @@ async def get_optimal_fantasy_team(circuit_id: str = "bahrain", budget: float = 
                 break
             if d in picked or used_teams.get(d["team"], 0) >= 2:
                 continue
-            if d["price"] <= remaining - min_con:
+            if d["price"] <= remaining - two_con_cost:
                 picked.append(d)
                 remaining -= d["price"]
                 used_teams[d["team"]] = used_teams.get(d["team"], 0) + 1
 
-    # constructor: most points that still fits the remaining budget
-    affordable_con = [c for c in con_scores if c["price"] <= remaining]
-    sel_con = (max(affordable_con, key=lambda c: c["predicted_points"])
-               if affordable_con else (min(con_scores, key=lambda c: c["price"]) if con_scores else None))
+    # pick 2 constructors: greedily take the most points that still leaves enough
+    # budget for a second (cheapest) constructor
+    constructors: List[Dict] = []
+    for _ in range(2):
+        need_after = min_con if len(constructors) == 0 else 0.0
+        candidates = [c for c in con_scores
+                      if c not in constructors and c["price"] <= remaining - need_after]
+        pick = (max(candidates, key=lambda c: c["predicted_points"]) if candidates else
+                next((c for c in sorted(con_scores, key=lambda c: c["price"]) if c not in constructors), None))
+        if pick is None:
+            break
+        constructors.append(pick)
+        remaining -= pick["price"]
     captain = max(picked, key=lambda x: x["predicted_points"]) if picked else None
 
     total_pts = sum(d["predicted_points"] * (2 if captain and d["code"] == captain["code"] else 1) for d in picked)
-    total_cost = sum(d["price"] for d in picked)
-    if sel_con:
-        total_pts += sel_con["predicted_points"]
-        total_cost += sel_con["price"]
+    total_pts += sum(c["predicted_points"] for c in constructors)
+    total_cost = sum(d["price"] for d in picked) + sum(c["price"] for c in constructors)
 
     src = f"real {season} form" if season else "model estimates"
+    con_names = " + ".join(c["name"] for c in constructors) or "N/A"
     return {
         "circuit": circuit_id, "budget": budget,
         "total_cost": round(total_cost, 1), "budget_remaining": round(budget - total_cost, 1),
-        "drivers": picked, "constructor": sel_con, "captain": captain,
+        "drivers": picked, "constructors": constructors,
+        "constructor": constructors[0] if constructors else None,  # back-compat
+        "captain": captain,
         "total_predicted_points": round(total_pts, 1),
-        "reasoning": (f"Best value (pts/$M) within ${budget:.0f}M using {src}; "
+        "reasoning": (f"5 drivers + 2 constructors ({con_names}) within ${budget:.0f}M using {src}; "
                       f"max 2 drivers per team. Captain {captain['name'] if captain else 'N/A'} earns 2x."),
     }
 

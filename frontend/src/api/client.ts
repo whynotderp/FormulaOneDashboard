@@ -78,6 +78,8 @@ export interface Position {
   position: number;
   gap_to_leader: number;
   interval: number;
+  laps_down?: number;
+  interval_laps?: number;
 }
 
 export interface PredictionResult {
@@ -124,7 +126,8 @@ export interface FantasyTeam {
   total_cost: number;
   budget_remaining: number;
   drivers: FantasyDriver[];
-  constructor: FantasyConstructor;
+  constructors: FantasyConstructor[];
+  constructor?: FantasyConstructor;
   captain: FantasyDriver;
   total_predicted_points: number;
   reasoning: string;
