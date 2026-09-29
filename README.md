@@ -22,7 +22,7 @@ A full-stack Formula 1 telemetry and analytics dashboard featuring real-time ses
 - Data: OpenF1 API with mock fallback
 
 ### Tab 2 — Race Outcome Predictor
-- Weighted ML-style scoring: Qualifying (40%), Team Pace (25%), Recent Form/5 races (20%), Circuit Factor (15%)
+- Weighted model scoring: Qualifying (40%), Team Pace (25%), Recent Form/5 races (20%), Circuit Factor (15%)
 - Predicted podium with gold/silver/bronze cards
 - Semi-circular gauge charts for Safety Car, VSC, Red Flag probabilities
 - Full 20-driver grid with confidence bars and crash risk coloring
